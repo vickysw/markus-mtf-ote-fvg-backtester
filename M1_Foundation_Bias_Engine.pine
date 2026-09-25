@@ -213,8 +213,9 @@ else if biasDir == -1 and not na(swHigh) and not na(swLow)
 // ============================================================================
 var string G_LIQ = "3. Liquidity / EQL Filter"
 eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = reject setup if equal-lows/highs (double bottom/top) liquidity sits at the swing origin. ON = allow trade anyway, for winrate A/B comparison.")
+eqlPivotLen    = input.int(7, "EQL Pivot Length (4H bars)", minval=2, group=G_LIQ, tooltip="Independent of Section 1's Swing Pivot Length — controls only how sensitive EQL's own minor-pivot detection is, does not affect the macro fib-zone swing")
 eqlAtrSens     = input.float(0.10, "EQL ATR Sensitivity", minval=0.01, step=0.01, group=G_LIQ, tooltip="Max distance, in ATR, between two PIVOT lows/highs to count as 'equal' liquidity (double bottom/top)")
-eqlPivotDepth  = input.int(5, "EQL Pivot History Depth", minval=1, maxval=20, group=G_LIQ, tooltip="How many prior 4H swing pivots to compare each new pivot against")
+eqlPivotDepth  = input.int(5, "EQL Pivot History Depth", minval=1, maxval=20, group=G_LIQ, tooltip="How many prior EQL pivots to compare each new pivot against")
 
 // Compares confirmed PIVOT to prior PIVOTS only (true double-bottom/top test) —
 // deliberately does NOT compare raw adjacent candles to a fresh pivot, since
@@ -251,7 +252,7 @@ f_eql_scan(_pivotLen, _sensMult, _maxPivots) =>
             array.shift(highPivots)
     [eqlLowState, eqlHighState]
 
-[eqlAtSwingLow, eqlAtSwingHigh] = request.security(syminfo.tickerid, "240", f_eql_scan(swingLookback, eqlAtrSens, eqlPivotDepth), barmerge.gaps_off, barmerge.lookahead_off)
+[eqlAtSwingLow, eqlAtSwingHigh] = request.security(syminfo.tickerid, "240", f_eql_scan(eqlPivotLen, eqlAtrSens, eqlPivotDepth), barmerge.gaps_off, barmerge.lookahead_off)
 
 eqlDetected   = biasDir == 1 ? eqlAtSwingLow : biasDir == -1 ? eqlAtSwingHigh : false
 liquidityGate = eqlAllowToggle ? true : not eqlDetected
