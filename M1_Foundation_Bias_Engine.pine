@@ -199,8 +199,8 @@ pdArrayRequired = biasLevel == 2 or biasLevel == 3
 pdArrayGate     = pdArrayRequired ? pdArrayOk : true
 
 // entry-zone band (fibEntryLevel .. deep boundary), anchored off the 4H swing, in bias direction
-fibZoneTop = na(float(na))
-fibZoneBot = na(float(na))
+float fibZoneTop = na
+float fibZoneBot = na
 if biasDir == 1 and not na(swHigh) and not na(swLow)
     fibZoneTop := swHigh - fibEntryLevel * (swHigh - swLow)
     fibZoneBot := swHigh - (allowDeepZone ? 0.79 : 0.705) * (swHigh - swLow)
