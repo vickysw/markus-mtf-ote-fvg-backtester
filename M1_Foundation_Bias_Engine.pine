@@ -307,12 +307,20 @@ plotchar(setupCandidate, "Setup Candidate (M1 checks passed)", "▲", location.b
 plotchar(eqlDetected, "EQL Detected", "×", location.abovebar, color=color.red, size=size.tiny)
 
 var label biasLbl = na
+var label debugLbl = na
 if barstate.islast
     label.delete(biasLbl)
     lvlTxt = biasLevel == 0 ? "WALKAWAY" : "Level " + str.tostring(biasLevel)
     dirTxt = biasDir == 1 ? "LONG" : biasDir == -1 ? "SHORT" : "-"
     statusTxt = setupCandidate ? " [CANDIDATE]" : " [BLOCKED]"
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
+
+    // TEMP DEBUG (M1 QA only, remove before final delivery): print exact swing
+    // high/low + fib zone numbers the script is using, to cross-check against
+    // a manually-drawn TradingView fib tool.
+    debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, "#.###") + " swLow=" + str.tostring(swLow, "#.###") + " | fibZoneTop=" + str.tostring(fibZoneTop, "#.###") + " fibZoneBot=" + str.tostring(fibZoneBot, "#.###")
+    label.delete(debugLbl)
+    debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
     if killzoneUnmapped
         label.new(bar_index, low - mainAtr, "⚠ Ticker '" + syminfo.ticker + "' not in killzone map — add it to f_killzone_session()", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
