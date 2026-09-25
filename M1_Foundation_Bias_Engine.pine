@@ -67,7 +67,7 @@ var string G_BIAS = "2. HTF Bias & PD-Array"
 dailyExtLen  = input.int(20, "Daily External Pivot Length", minval=2, group=G_BIAS)
 dailyIntLen  = input.int(5, "Daily Internal Pivot Length", minval=2, group=G_BIAS)
 biasMinLevel = input.string("Level 2", "Minimum Bias Level to Trade", options=["Level 1", "Level 2", "Level 3", "Walkaway (halt all)"], group=G_BIAS, tooltip="Level 1 = A+ only (strictest, fewest trades). Level 3 = accept Level 1/2/3 (loosest). Walkaway = manual kill-switch, no trades regardless of engine state.")
-pdArrayMode  = input.string("Both FVG & OB", "Daily PD-Array Filter Mode", options=["FVG Only", "Order Block Only", "Both FVG & OB"], group=G_BIAS, tooltip="Applies to Level 2 / Level 3 setups only, per Appendix: 4H must be retracing into a Daily discount/premium PD-array")
+pdArrayMode  = input.string("Both FVG & OB", "Daily PD-Array Filter Mode", options=["FVG Only", "Order Block Only", "Both FVG & OB"], group=G_BIAS, tooltip="Standalone filter applied to all bias levels equally: price must be retracing into a Daily discount/premium FVG or Order Block (per client confirmation, independent of bias Level)")
 
 f_smc_choch_trend(_len) =>
     p_high = ta.pivothigh(high, _len, _len)
@@ -138,7 +138,7 @@ bias_tradeable = biasLevel != 0 and biasLevel <= minLevelNum
 if biasMinLevel == "Walkaway (halt all)"
     bias_tradeable := false
 
-// ---- Daily PD-Array (FVG / OB) discount-zone check, required for Level 2/3 ----
+// ---- Daily PD-Array (FVG / OB) discount-zone check — standalone filter ----
 // Simplified per agreed scope trim (see status.md): single most-recent
 // unmitigated instance per direction, not an exhaustive multi-candidate engine.
 f_daily_fvg(_dir) =>
@@ -200,9 +200,11 @@ priceInBearZone_OB  = not na(lastBearObTop) and close <= lastBearObTop and close
 priceInBullZone = pdArrayMode == "FVG Only" ? priceInBullZone_FVG : pdArrayMode == "Order Block Only" ? priceInBullZone_OB : (priceInBullZone_FVG or priceInBullZone_OB)
 priceInBearZone = pdArrayMode == "FVG Only" ? priceInBearZone_FVG : pdArrayMode == "Order Block Only" ? priceInBearZone_OB : (priceInBearZone_FVG or priceInBearZone_OB)
 
-pdArrayOk       = biasDir == 1 ? priceInBullZone : biasDir == -1 ? priceInBearZone : false
-pdArrayRequired = biasLevel == 2 or biasLevel == 3
-pdArrayGate     = pdArrayRequired ? pdArrayOk : true
+// Standalone confluence filter, independent of bias Level (confirmed with
+// client 2026-09-25: his bias engine is direction-only, unrelated to whether
+// price has reached a discount FVG/OB — applies equally to all levels).
+pdArrayOk   = biasDir == 1 ? priceInBullZone : biasDir == -1 ? priceInBearZone : false
+pdArrayGate = pdArrayOk
 
 // entry-zone band (fibEntryLevel .. deep boundary), anchored off the 4H swing, in bias direction
 float fibZoneTop = na
