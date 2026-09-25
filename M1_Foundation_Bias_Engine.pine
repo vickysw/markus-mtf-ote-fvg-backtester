@@ -263,7 +263,7 @@ f_killzone_session() =>
         t == "GBPJPY" => "0830-1130"
         t == "XAUUSD" => "0830-1130,1530-1900"
         t == "USTEC100" or t == "NAS100" or t == "US100" or t == "USTEC" => "1530-1900"
-        t == "SPX500" or t == "US500" or t == "SP500" => "1530-1900"
+        t == "SPX500" or t == "US500" or t == "SP500" or t == "SPX" => "1530-1900"
         t == "US30" or t == "DJ30" => "1530-1900"
         => "0000-2359"
     sess
