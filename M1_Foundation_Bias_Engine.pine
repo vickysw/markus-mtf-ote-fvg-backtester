@@ -24,6 +24,12 @@
 indicator("Markus MTF OTE/FVG — M1 Foundation & Bias Engine", shorttitle="Markus M1", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
 // ============================================================================
+// 0. DEBUG (QA only — leave off for normal use)
+// ============================================================================
+var string G_DEBUG = "0. Debug"
+showDebug = input.bool(false, "Show Debug Label (swHigh/swLow/fibZone values)", group=G_DEBUG, tooltip="For QA cross-checking against a manually-drawn fib tool. Leave off for normal use.")
+
+// ============================================================================
 // 1. FIBONACCI & ENTRY ZONE
 // ============================================================================
 var string G_FIB = "1. Fibonacci & Entry Zone"
@@ -315,12 +321,13 @@ if barstate.islast
     statusTxt = setupCandidate ? " [CANDIDATE]" : " [BLOCKED]"
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
-    // TEMP DEBUG (M1 QA only, remove before final delivery): print exact swing
+    // Debug label (toggle via "0. Debug" input group): prints exact swing
     // high/low + fib zone numbers the script is using, to cross-check against
     // a manually-drawn TradingView fib tool.
-    debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, "#.###") + " swLow=" + str.tostring(swLow, "#.###") + " | fibZoneTop=" + str.tostring(fibZoneTop, "#.###") + " fibZoneBot=" + str.tostring(fibZoneBot, "#.###")
-    label.delete(debugLbl)
-    debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
+    if showDebug
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, "#.###") + " swLow=" + str.tostring(swLow, "#.###") + " | fibZoneTop=" + str.tostring(fibZoneTop, "#.###") + " fibZoneBot=" + str.tostring(fibZoneBot, "#.###")
+        label.delete(debugLbl)
+        debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
     if killzoneUnmapped
         label.new(bar_index, low - mainAtr, "⚠ Ticker '" + syminfo.ticker + "' not in killzone map — add it to f_killzone_session()", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
