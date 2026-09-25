@@ -1,0 +1,129 @@
+// Client's own script (shared as reference for his BIAS/strategy) — "BIAS 3 Filter.docx"
+// SMC FTMO Risk Dashboard V15 - Ultimate Fixed
+// This IS a working Level 1/2/3/Walkaway-equivalent bias classification engine:
+//   Weekly candle-body DNA (bullish/bearish engulfing/normal/reversal)
+//   + Daily external/internal CHoCH (pivot-confirmed swing break, via request.security lookahead_off)
+//   -> combined into risk tiers: Level 1 (A+), Level 2 (Standard), Level 3 (Neutral Macro), Walkaway
+// Plan: wire this logic directly into the backtester as the bias engine instead of rebuilding from spec text.
+
+//@version=5
+indicator("SMC FTMO Risk Dashboard V15 - Ultimate Fixed", overlay=true)
+
+// ==========================================
+// 1. INPUTS & INSTÄLLNINGAR
+// ==========================================
+var string G_BIAS   = "SMC Struktur-inställningar (CHoCH)"
+swing_len           = input.int(20, "Daily External Pivot Length", minval=2, group=G_BIAS, tooltip="Känslighet för stora externa strukturskiften (CHoCH)")
+internal_len        = input.int(5, "Daily Internal Pivot Length", minval=2, group=G_BIAS, tooltip="Känslighet för små interna strukturskiften (CHoCH)")
+
+var string G_COLOR  = "Färg & Design"
+tbl_pos             = input.string("top_right", "Position på skärmen", options=["top_right", "bottom_right", "top_left", "bottom_left"], group=G_COLOR)
+c_text              = input.color(color.white, "Textfärg", group=G_COLOR)
+
+// ==========================================
+// 2. SMC-MOTOR FOR CHoCH (DAILY - ISOLERAD PURE BODY CLOSE)
+// ==========================================
+f_smc_choch_trend(_len) =>
+    p_high = ta.pivothigh(high, _len, _len)
+    p_low  = ta.pivotlow(low, _len, _len)
+
+    var float last_high = na
+    var float last_low  = na
+    var int current_trend = 0
+
+    if not na(p_high)
+        last_high := p_high
+    if not na(p_low)
+        last_low := p_low
+
+    if not na(last_high) and close > last_high
+        current_trend := 1
+        last_high := na
+    else if not na(last_low) and close < last_low
+        current_trend := -1
+        last_low := na
+
+    current_trend
+
+daily_ext = request.security(syminfo.tickerid, "D", f_smc_choch_trend(swing_len), barmerge.gaps_off, barmerge.lookahead_off)
+daily_int = request.security(syminfo.tickerid, "D", f_smc_choch_trend(internal_len), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ==========================================
+// 3. WEEKLY CANDLE DNA (DIREKTHÄMTNING UTAN FUNKTIONSBLOCKERING)
+// ==========================================
+w_open1  = request.security(syminfo.tickerid, "W", open[1], barmerge.gaps_off, barmerge.lookahead_off)
+w_close1 = request.security(syminfo.tickerid, "W", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+w_high1  = request.security(syminfo.tickerid, "W", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+w_low1   = request.security(syminfo.tickerid, "W", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+w_open2  = request.security(syminfo.tickerid, "W", open[2], barmerge.gaps_off, barmerge.lookahead_off)
+w_close2 = request.security(syminfo.tickerid, "W", close[2], barmerge.gaps_off, barmerge.lookahead_off)
+w_high2  = request.security(syminfo.tickerid, "W", high[2], barmerge.gaps_off, barmerge.lookahead_off)
+w_low2   = request.security(syminfo.tickerid, "W", low[2], barmerge.gaps_off, barmerge.lookahead_off)
+
+prev_body_high = math.max(w_open2, w_close2)
+prev_body_low  = math.min(w_open2, w_close2)
+
+is_bull_eng   = (w_close1 > w_open1) and (w_open1 < w_low2) and (w_close1 > w_high2)
+is_bull_norm  = (w_close1 > w_open1) and (w_close1 > prev_body_high)
+is_bull_rev   = (w_low1 < w_low2) and (w_close1 > w_open1) and (w_close1 > prev_body_high)
+
+is_bear_eng   = (w_close1 < w_open1) and (w_open1 > w_high2) and (w_close1 < w_low2)
+is_bear_norm  = (w_close1 < w_open1) and (w_close1 < prev_body_low)
+is_bear_rev   = (w_high1 > w_high2) and (w_close1 < w_open1) and (w_close1 < prev_body_low)
+
+int weekly_bias = 0
+if is_bull_eng or is_bull_norm or is_bull_rev
+    weekly_bias := 1
+else if is_bear_eng or is_bear_norm or is_bear_rev
+    weekly_bias := -1
+
+// ==========================================
+// 4. STRATEGY- OCH RISKLOGIK (NIVÅ 1 & NIVÅ 2)
+// ==========================================
+var string risk_text  = "WALKAWAY (Ingen Synk)"
+var color risk_color  = color.red
+
+if weekly_bias == 1 and daily_ext == 1 and daily_int == 1
+    risk_text  := "RISK: 0.50% (Nivå 1 - A+ Long)"
+    risk_color := color.green
+else if weekly_bias == 1 and daily_ext == 1 and daily_int == -1
+    risk_text  := "RISK: 0.50% (Nivå 2 - Standard Long)"
+    risk_color := color.teal
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == -1
+    risk_text  := "RISK: 0.50% (Nivå 1 - A+ Short)"
+    risk_color := color.green
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == 1
+    risk_text  := "RISK: 0.50% (Nivå 2 - Standard Short)"
+    risk_color := color.teal
+else if weekly_bias == 0 and daily_ext == 1
+    risk_text  := "RISK: 0.25% (Nivå 3 - Neutral Macro Long)"
+    risk_color := color.orange
+else if weekly_bias == 0 and daily_ext == -1
+    risk_text  := "RISK: 0.25% (Nivå 3 - Neutral Macro Short)"
+    risk_color := color.orange
+else
+    risk_text  := "WALKAWAY (Ingen Synk)"
+    risk_color := color.red
+
+// ==========================================
+// 5. VISUELL PANEL (TABLE)
+// ==========================================
+var position_type = tbl_pos == "top_right" ? position.top_right : tbl_pos == "bottom_right" ? position.bottom_right : tbl_pos == "top_left" ? position.top_left : position.bottom_left
+var table r_table = table.new(position = position_type, columns = 2, rows = 5, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.gray)
+
+if barstate.islast
+    table.cell(r_table, 0, 0, "SMC Strategi-Metrik", bgcolor=color.gray, text_color=c_text, text_size=size.small)
+    table.cell(r_table, 1, 0, "Isolerad Status / BIAS", bgcolor=color.gray, text_color=c_text, text_size=size.small)
+
+    table.cell(r_table, 0, 1, "Weekly Candle DNA (Kropp)", text_color=c_text, text_size=size.small)
+    table.cell(r_table, 1, 1, weekly_bias == 1 ? "BULLISH" : weekly_bias == -1 ? "BEARISH" : "NEUTRAL", bgcolor=weekly_bias == 1 ? color.green : weekly_bias == -1 ? color.red : color.orange, text_color=c_text, text_size=size.small)
+
+    table.cell(r_table, 0, 2, "Daily External CHoCH", text_color=c_text, text_size=size.small)
+    table.cell(r_table, 1, 2, daily_ext == 1 ? "BULLISH" : daily_ext == -1 ? "BEARISH" : "KONSOLIDERING", bgcolor=daily_ext == 1 ? color.green : daily_ext == -1 ? color.red : color.orange, text_color=c_text, text_size=size.small)
+
+    table.cell(r_table, 0, 3, "Daily Internal CHoCH", text_color=c_text, text_size=size.small)
+    table.cell(r_table, 1, 3, daily_int == 1 ? "BULLISH" : daily_int == -1 ? "BEARISH" : "KONSOLIDERING", bgcolor=daily_int == 1 ? color.green : daily_int == -1 ? color.red : color.orange, text_color=c_text, text_size=size.small)
+
+    table.cell(r_table, 0, 4, "FTMO Exekverings Risk", bgcolor=risk_color, text_color=color.white, text_size=size.small)
+    table.cell(r_table, 1, 4, risk_text, bgcolor=risk_color, text_color=color.white, text_size=size.small)

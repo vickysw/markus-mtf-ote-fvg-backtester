@@ -1,0 +1,304 @@
+// ============================================================================
+// Markus — Multi-Timeframe OTE & FVG Backtester
+// MILESTONE 1 — Foundation & Bias Engine  (DRAFT — not yet client-reviewed)
+//
+// Scope (per agreed $500 M1 breakdown):
+//   1. Fibonacci & Entry Zone inputs
+//   2. HTF Bias Engine — ported from client's own BIAS_3_Filter.pine, wired
+//      into a Level 1 / Level 2 / Level 3 / Walkaway dropdown
+//   3. Daily PD-Array Filter Mode (FVG Only / Order Block Only / Both)
+//   4. Liquidity / EQL detection filter
+//   5. Killzone / session filter for all 10 assets (UTC+2)
+//
+// OUT OF SCOPE for M1 (later milestones):
+//   M2 — entry trigger (limit/CISD), all 3 SL models, position sizing, TP,
+//        break-even state machine
+//   M3 — news filter, SMT/correlated-asset filter, performance dashboard,
+//        6-line per-trade visualization, full historical backtest
+//
+// Intended chart timeframe: 15m (client's entry TF). 4H / Daily / Weekly data
+// pulled via request.security(..., barmerge.lookahead_off) => non-repainting.
+// ============================================================================
+
+//@version=5
+indicator("Markus MTF OTE/FVG — M1 Foundation & Bias Engine", shorttitle="Markus M1", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ============================================================================
+// 1. FIBONACCI & ENTRY ZONE
+// ============================================================================
+var string G_FIB = "1. Fibonacci & Entry Zone"
+swingLookback = input.int(15, "4H Swing Pivot Length", minval=2, group=G_FIB, tooltip="Bars each side required to confirm a 4H structural swing high/low")
+fibEntryLevel = input.float(0.705, "Fib Entry Level", options=[0.5, 0.62, 0.66, 0.705, 0.79], group=G_FIB)
+allowDeepZone = input.bool(true, "Allow 0.79 Deep OTE Zone", group=G_FIB, tooltip="If false, the deep boundary of the entry band is capped at 0.705 instead of 0.79")
+
+// last confirmed 4H swing high/low, computed non-repainting on the 4H stream
+f_htf_swing(_len) =>
+    ph = ta.pivothigh(high, _len, _len)
+    pl = ta.pivotlow(low, _len, _len)
+    var float lastHigh = na
+    var float lastLow  = na
+    var int lastHighTime = na
+    var int lastLowTime  = na
+    if not na(ph)
+        lastHigh := ph
+        lastHighTime := time[_len]
+    if not na(pl)
+        lastLow := pl
+        lastLowTime := time[_len]
+    [lastHigh, lastLow, lastHighTime, lastLowTime]
+
+[swHigh, swLow, swHighTime, swLowTime] = request.security(syminfo.tickerid, "240", f_htf_swing(swingLookback), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ============================================================================
+// 2. HTF BIAS ENGINE — ported unchanged from client's BIAS_3_Filter.pine
+//    (weekly candle-body DNA + daily external/internal CHoCH). Client's own
+//    Level numbering used as-is (Level 1 = strictest/A+ ... Level 3 =
+//    loosest/neutral) rather than the spec appendix wording — per status.md
+//    this was the agreed approach so the engine matches what he already
+//    trusts/uses.
+// ============================================================================
+var string G_BIAS = "2. HTF Bias & PD-Array"
+dailyExtLen  = input.int(20, "Daily External Pivot Length", minval=2, group=G_BIAS)
+dailyIntLen  = input.int(5, "Daily Internal Pivot Length", minval=2, group=G_BIAS)
+biasMinLevel = input.string("Level 2", "Minimum Bias Level to Trade", options=["Level 1", "Level 2", "Level 3", "Walkaway (halt all)"], group=G_BIAS, tooltip="Level 1 = A+ only (strictest, fewest trades). Level 3 = accept Level 1/2/3 (loosest). Walkaway = manual kill-switch, no trades regardless of engine state.")
+pdArrayMode  = input.string("Both FVG & OB", "Daily PD-Array Filter Mode", options=["FVG Only", "Order Block Only", "Both FVG & OB"], group=G_BIAS, tooltip="Applies to Level 2 / Level 3 setups only, per Appendix: 4H must be retracing into a Daily discount/premium PD-array")
+
+f_smc_choch_trend(_len) =>
+    p_high = ta.pivothigh(high, _len, _len)
+    p_low  = ta.pivotlow(low, _len, _len)
+    var float last_high = na
+    var float last_low  = na
+    var int trend = 0
+    if not na(p_high)
+        last_high := p_high
+    if not na(p_low)
+        last_low := p_low
+    if not na(last_high) and close > last_high
+        trend := 1
+        last_high := na
+    else if not na(last_low) and close < last_low
+        trend := -1
+        last_low := na
+    trend
+
+daily_ext = request.security(syminfo.tickerid, "D", f_smc_choch_trend(dailyExtLen), barmerge.gaps_off, barmerge.lookahead_off)
+daily_int = request.security(syminfo.tickerid, "D", f_smc_choch_trend(dailyIntLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+f_weekly_dna() =>
+    w_open1  = open[1]
+    w_close1 = close[1]
+    w_high1  = high[1]
+    w_low1   = low[1]
+    w_open2  = open[2]
+    w_close2 = close[2]
+    w_high2  = high[2]
+    w_low2   = low[2]
+    prev_body_high = math.max(w_open2, w_close2)
+    prev_body_low  = math.min(w_open2, w_close2)
+    is_bull = (w_close1 > w_open1) and ((w_open1 < w_low2 and w_close1 > w_high2) or (w_close1 > prev_body_high) or (w_low1 < w_low2 and w_close1 > prev_body_high))
+    is_bear = (w_close1 < w_open1) and ((w_open1 > w_high2 and w_close1 < w_low2) or (w_close1 < prev_body_low) or (w_high1 > w_high2 and w_close1 < prev_body_low))
+    is_bull ? 1 : is_bear ? -1 : 0
+
+weekly_bias = request.security(syminfo.tickerid, "W", f_weekly_dna(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Level / direction classification — exact mapping from client's own script
+var int biasLevel = 0   // 1 = A+, 2 = Standard, 3 = Neutral Macro, 0 = Walkaway
+var int biasDir   = 0   // 1 = long, -1 = short, 0 = none
+
+if weekly_bias == 1 and daily_ext == 1 and daily_int == 1
+    biasLevel := 1
+    biasDir   := 1
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == -1
+    biasLevel := 1
+    biasDir   := -1
+else if weekly_bias == 1 and daily_ext == 1 and daily_int == -1
+    biasLevel := 2
+    biasDir   := 1
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == 1
+    biasLevel := 2
+    biasDir   := -1
+else if weekly_bias == 0 and daily_ext == 1
+    biasLevel := 3
+    biasDir   := 1
+else if weekly_bias == 0 and daily_ext == -1
+    biasLevel := 3
+    biasDir   := -1
+else
+    biasLevel := 0
+    biasDir   := 0
+
+minLevelNum    = biasMinLevel == "Level 1" ? 1 : biasMinLevel == "Level 2" ? 2 : biasMinLevel == "Level 3" ? 3 : 99
+bias_tradeable = biasLevel != 0 and biasLevel <= minLevelNum
+if biasMinLevel == "Walkaway (halt all)"
+    bias_tradeable := false
+
+// ---- Daily PD-Array (FVG / OB) discount-zone check, required for Level 2/3 ----
+// Simplified per agreed scope trim (see status.md): single most-recent
+// unmitigated instance per direction, not an exhaustive multi-candidate engine.
+f_daily_fvg(_dir) =>
+    float top = na
+    float bot = na
+    if _dir == 1 and low > high[2]
+        top := low
+        bot := high[2]
+    else if _dir == -1 and high < low[2]
+        top := low[2]
+        bot := high
+    [top, bot]
+
+[fvgBullTop, fvgBullBot] = request.security(syminfo.tickerid, "D", f_daily_fvg(1), barmerge.gaps_off, barmerge.lookahead_off)
+[fvgBearTop, fvgBearBot] = request.security(syminfo.tickerid, "D", f_daily_fvg(-1), barmerge.gaps_off, barmerge.lookahead_off)
+
+var float lastBullFvgTop = na
+var float lastBullFvgBot = na
+var float lastBearFvgTop = na
+var float lastBearFvgBot = na
+if not na(fvgBullTop)
+    lastBullFvgTop := fvgBullTop
+    lastBullFvgBot := fvgBullBot
+if not na(fvgBearTop)
+    lastBearFvgTop := fvgBearTop
+    lastBearFvgBot := fvgBearBot
+
+// simplified OB: last opposite-colour daily candle immediately before a same-direction break of its range
+f_daily_ob(_dir) =>
+    float top = na
+    float bot = na
+    if _dir == 1 and close[1] < open[1] and close > high[1]
+        top := high[1]
+        bot := low[1]
+    else if _dir == -1 and close[1] > open[1] and close < low[1]
+        top := low[1]
+        bot := high[1]
+    [top, bot]
+
+[obBullTop, obBullBot] = request.security(syminfo.tickerid, "D", f_daily_ob(1), barmerge.gaps_off, barmerge.lookahead_off)
+[obBearTop, obBearBot] = request.security(syminfo.tickerid, "D", f_daily_ob(-1), barmerge.gaps_off, barmerge.lookahead_off)
+
+var float lastBullObTop = na
+var float lastBullObBot = na
+var float lastBearObTop = na
+var float lastBearObBot = na
+if not na(obBullTop)
+    lastBullObTop := obBullTop
+    lastBullObBot := obBullBot
+if not na(obBearTop)
+    lastBearObTop := obBearTop
+    lastBearObBot := obBearBot
+
+priceInBullZone_FVG = not na(lastBullFvgTop) and close <= lastBullFvgTop and close >= lastBullFvgBot
+priceInBullZone_OB  = not na(lastBullObTop) and close <= lastBullObTop and close >= lastBullObBot
+priceInBearZone_FVG = not na(lastBearFvgTop) and close <= lastBearFvgTop and close >= lastBearFvgBot
+priceInBearZone_OB  = not na(lastBearObTop) and close <= lastBearObTop and close >= lastBearObBot
+
+priceInBullZone = pdArrayMode == "FVG Only" ? priceInBullZone_FVG : pdArrayMode == "Order Block Only" ? priceInBullZone_OB : (priceInBullZone_FVG or priceInBullZone_OB)
+priceInBearZone = pdArrayMode == "FVG Only" ? priceInBearZone_FVG : pdArrayMode == "Order Block Only" ? priceInBearZone_OB : (priceInBearZone_FVG or priceInBearZone_OB)
+
+pdArrayOk       = biasDir == 1 ? priceInBullZone : biasDir == -1 ? priceInBearZone : false
+pdArrayRequired = biasLevel == 2 or biasLevel == 3
+pdArrayGate     = pdArrayRequired ? pdArrayOk : true
+
+// entry-zone band (fibEntryLevel .. deep boundary), anchored off the 4H swing, in bias direction
+fibZoneTop = na(float(na))
+fibZoneBot = na(float(na))
+if biasDir == 1 and not na(swHigh) and not na(swLow)
+    fibZoneTop := swHigh - fibEntryLevel * (swHigh - swLow)
+    fibZoneBot := swHigh - (allowDeepZone ? 0.79 : 0.705) * (swHigh - swLow)
+else if biasDir == -1 and not na(swHigh) and not na(swLow)
+    fibZoneBot := swLow + fibEntryLevel * (swHigh - swLow)
+    fibZoneTop := swLow + (allowDeepZone ? 0.79 : 0.705) * (swHigh - swLow)
+
+// ============================================================================
+// 3. LIQUIDITY / EQL DETECTION FILTER
+// ============================================================================
+var string G_LIQ = "3. Liquidity / EQL Filter"
+eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = reject setup if equal-lows/highs (double bottom/top) liquidity sits at the swing origin. ON = allow trade anyway, for winrate A/B comparison.")
+eqlAtrSens     = input.float(0.15, "EQL ATR Sensitivity", minval=0.01, step=0.01, group=G_LIQ, tooltip="Max distance, in ATR, between two swing-origin lows/highs to count as 'equal' liquidity")
+eqlLookback    = input.int(30, "EQL Scan Lookback (4H bars)", minval=5, group=G_LIQ)
+
+f_eql_scan(_pivotLen, _scanLen, _sensMult) =>
+    pl = ta.pivotlow(low, _pivotLen, _pivotLen)
+    ph = ta.pivothigh(high, _pivotLen, _pivotLen)
+    var float lastLow  = na
+    var float lastHigh = na
+    if not na(pl)
+        lastLow := pl
+    if not na(ph)
+        lastHigh := ph
+    atrv = ta.atr(14)
+    bool eqlLow  = false
+    bool eqlHigh = false
+    if not na(lastLow)
+        for i = 1 to _scanLen
+            if not na(low[i]) and low[i] != lastLow and math.abs(low[i] - lastLow) <= atrv * _sensMult
+                eqlLow := true
+    if not na(lastHigh)
+        for i = 1 to _scanLen
+            if not na(high[i]) and high[i] != lastHigh and math.abs(high[i] - lastHigh) <= atrv * _sensMult
+                eqlHigh := true
+    [eqlLow, eqlHigh]
+
+[eqlAtSwingLow, eqlAtSwingHigh] = request.security(syminfo.tickerid, "240", f_eql_scan(swingLookback, eqlLookback, eqlAtrSens), barmerge.gaps_off, barmerge.lookahead_off)
+
+eqlDetected   = biasDir == 1 ? eqlAtSwingLow : biasDir == -1 ? eqlAtSwingHigh : false
+liquidityGate = eqlAllowToggle ? true : not eqlDetected
+
+// ============================================================================
+// 4. KILLZONE / SESSION FILTER — all 10 assets, UTC+2 (client is in Sweden)
+//    TODO before go-live: confirm exact TradingView ticker strings with
+//    client's broker feed (index/gold symbols vary by broker, e.g. "USTEC"
+//    vs "NAS100" vs "US100USD").
+// ============================================================================
+var string G_SESSION = "4. Killzone / Session Filter"
+useKillzone = input.bool(true, "Restrict Entries to Killzone", group=G_SESSION)
+
+f_killzone_session() =>
+    t = syminfo.ticker
+    string sess = switch
+        t == "EURUSD" => "0800-1640"
+        t == "GBPUSD" => "0800-1640"
+        t == "AUDUSD" => "0800-1640,0030-0530"
+        t == "NZDUSD" => "0800-1640,0030-0530"
+        t == "EURJPY" => "0830-1130"
+        t == "GBPJPY" => "0830-1130"
+        t == "XAUUSD" => "0830-1130,1530-1900"
+        t == "USTEC100" or t == "NAS100" or t == "US100" or t == "USTEC" => "1530-1900"
+        t == "SPX500" or t == "US500" or t == "SP500" => "1530-1900"
+        t == "US30" or t == "DJ30" => "1530-1900"
+        => "0000-2359"
+    sess
+
+killzoneSession = f_killzone_session()
+inKillzone       = not na(time(timeframe.period, killzoneSession, "UTC+2"))
+killzoneGate     = useKillzone ? inKillzone : true
+killzoneUnmapped = killzoneSession == "0000-2359"
+
+// ============================================================================
+// 5. VISUAL SANITY-CHECK (M1 only — full dashboard & per-trade 6-line
+//    visualization with persisted line/box arrays across the whole history
+//    is an M3 deliverable, not built here)
+// ============================================================================
+mainAtr = ta.atr(14)
+
+bgcolor(biasDir == 1 ? color.new(color.green, 92) : biasDir == -1 ? color.new(color.red, 92) : color.new(color.gray, 95), title="Bias Direction")
+
+var box fibBox = na
+if not na(fibZoneTop) and not na(fibZoneBot)
+    box.delete(fibBox)
+    fibBox := box.new(bar_index[1], fibZoneTop, bar_index + 20, fibZoneBot, border_color=color.blue, bgcolor=color.new(color.blue, 85), xloc=xloc.bar_index)
+
+setupCandidate = bias_tradeable and pdArrayGate and killzoneGate and liquidityGate
+
+plotchar(setupCandidate, "Setup Candidate (M1 checks passed)", "▲", location.belowbar, color=color.lime, size=size.tiny)
+plotchar(eqlDetected, "EQL Detected", "×", location.abovebar, color=color.red, size=size.tiny)
+
+var label biasLbl = na
+if barstate.islast
+    label.delete(biasLbl)
+    lvlTxt = biasLevel == 0 ? "WALKAWAY" : "Level " + str.tostring(biasLevel)
+    dirTxt = biasDir == 1 ? "LONG" : biasDir == -1 ? "SHORT" : "-"
+    statusTxt = setupCandidate ? " [CANDIDATE]" : " [BLOCKED]"
+    biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
+
+    if killzoneUnmapped
+        label.new(bar_index, low - mainAtr, "⚠ Ticker '" + syminfo.ticker + "' not in killzone map — add it to f_killzone_session()", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
