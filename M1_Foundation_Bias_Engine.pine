@@ -8,7 +8,9 @@
 //      into a Level 1 / Level 2 / Level 3 / Walkaway dropdown
 //   3. Daily PD-Array Filter Mode (FVG Only / Order Block Only / Both)
 //   4. Liquidity / EQL detection filter
-//   5. Killzone / session filter for all 10 assets (UTC+2)
+//   5. Killzone / session filter for all 10 assets (Stockholm local time,
+//      DST-aware) with selectable Session Mode (per-asset / London / NY /
+//      Combined / Asian / Dead Hours)
 //
 // OUT OF SCOPE for M1 (later milestones):
 //   M2 — entry trigger (limit/CISD), all 3 SL models, position sizing, TP,
@@ -18,6 +20,15 @@
 //
 // Intended chart timeframe: 15m (client's entry TF). 4H / Daily / Weekly data
 // pulled via request.security(..., barmerge.lookahead_off) => non-repainting.
+//
+// CHANGELOG (post-M1-signoff, per analysis-sheet review 2026-09-28, see
+// status.md "Analysis sheet review + decisions"):
+//   - Added "Off (No Bias Filter)" to Minimum Bias Level dropdown, for the
+//     analysis sheet's Test 1A no-bias control group.
+//   - Killzone timezone changed from fixed UTC+2 to Europe/Stockholm
+//     (DST-aware) — client confirmed.
+//   - Added Session Mode dropdown (per-asset killzone / London / New York /
+//     Combined / Asian / Dead Hours) for the analysis sheet's Test 2.
 // ============================================================================
 
 //@version=5
@@ -66,7 +77,7 @@ f_htf_swing(_len) =>
 var string G_BIAS = "2. HTF Bias & PD-Array"
 dailyExtLen  = input.int(20, "Daily External Pivot Length", minval=2, group=G_BIAS)
 dailyIntLen  = input.int(5, "Daily Internal Pivot Length", minval=2, group=G_BIAS)
-biasMinLevel = input.string("Level 2", "Minimum Bias Level to Trade", options=["Level 1", "Level 2", "Level 3", "Walkaway (halt all)"], group=G_BIAS, tooltip="Level 1 = A+ only (strictest, fewest trades). Level 3 = accept Level 1/2/3 (loosest). Walkaway = manual kill-switch, no trades regardless of engine state.")
+biasMinLevel = input.string("Level 2", "Minimum Bias Level to Trade", options=["Off (No Bias Filter)", "Level 1", "Level 2", "Level 3", "Walkaway (halt all)"], group=G_BIAS, tooltip="Off = ignore the Level requirement entirely (analysis-sheet Test 1A control group — any detected direction is tradeable). Level 1 = A+ only (strictest, fewest trades). Level 3 = accept Level 1/2/3 (loosest). Walkaway = manual kill-switch, no trades regardless of engine state.")
 pdArrayMode  = input.string("Both FVG & OB", "Daily PD-Array Filter Mode", options=["FVG Only", "Order Block Only", "Both FVG & OB"], group=G_BIAS, tooltip="Standalone filter applied to all bias levels equally: price must be retracing into a Daily discount/premium FVG or Order Block (per client confirmation, independent of bias Level)")
 
 f_smc_choch_trend(_len) =>
@@ -134,7 +145,7 @@ else
     biasDir   := 0
 
 minLevelNum    = biasMinLevel == "Level 1" ? 1 : biasMinLevel == "Level 2" ? 2 : biasMinLevel == "Level 3" ? 3 : 99
-bias_tradeable = biasLevel != 0 and biasLevel <= minLevelNum
+bias_tradeable = biasMinLevel == "Off (No Bias Filter)" ? biasDir != 0 : biasLevel != 0 and biasLevel <= minLevelNum
 if biasMinLevel == "Walkaway (halt all)"
     bias_tradeable := false
 
@@ -266,13 +277,18 @@ eqlDetected   = biasDir == 1 ? eqlAtSwingLow : biasDir == -1 ? eqlAtSwingHigh : 
 liquidityGate = eqlAllowToggle ? true : not eqlDetected
 
 // ============================================================================
-// 4. KILLZONE / SESSION FILTER — all 10 assets, UTC+2 (client is in Sweden)
+// 4. KILLZONE / SESSION FILTER — all 10 assets, Stockholm local time
+//    (Europe/Stockholm, DST-aware — client is in Sweden). Selectable Session
+//    Mode: per-asset killzone (default) or one of 5 fixed test windows
+//    (London/New York/Combined/Asian/Dead Hours) from the analysis-sheet
+//    Test 2, applied identically to every asset.
 //    TODO before go-live: confirm exact TradingView ticker strings with
 //    client's broker feed (index/gold symbols vary by broker, e.g. "USTEC"
 //    vs "NAS100" vs "US100USD").
 // ============================================================================
 var string G_SESSION = "4. Killzone / Session Filter"
 useKillzone = input.bool(true, "Restrict Entries to Killzone", group=G_SESSION)
+sessionMode = input.string("Per-Asset Killzone", "Session Mode", options=["Per-Asset Killzone", "London", "New York", "Combined (London+NY)", "Asian", "Dead Hours"], group=G_SESSION, tooltip="Per-Asset Killzone = each symbol's own window below (Killzones.docx). The other 5 are fixed windows, same for every asset, for the analysis-sheet's Base Test 2 (time-of-day volume analysis).")
 
 f_killzone_session() =>
     t = syminfo.ticker
@@ -290,10 +306,23 @@ f_killzone_session() =>
         => "0000-2359"
     sess
 
-killzoneSession = f_killzone_session()
-inKillzone       = not na(time(timeframe.period, killzoneSession, "UTC+2"))
+// Fixed test windows for Session Mode, matching Base Test 2 labels in the
+// analysis sheet (2A-2E). All Stockholm local time via the time() call below.
+f_fixed_session(_mode) =>
+    string sess = switch _mode
+        "London"                => "0800-1100"
+        "New York"               => "1400-1700"
+        "Combined (London+NY)"  => "0800-1100,1400-1700"
+        "Asian"                  => "0100-0500"
+        "Dead Hours"             => "1100-1400"
+        => "0000-2359"
+    sess
+
+perAssetSession  = f_killzone_session()
+killzoneSession  = sessionMode == "Per-Asset Killzone" ? perAssetSession : f_fixed_session(sessionMode)
+inKillzone       = not na(time(timeframe.period, killzoneSession, "Europe/Stockholm"))
 killzoneGate     = useKillzone ? inKillzone : true
-killzoneUnmapped = killzoneSession == "0000-2359"
+killzoneUnmapped = sessionMode == "Per-Asset Killzone" and perAssetSession == "0000-2359"
 
 // ============================================================================
 // 5. VISUAL SANITY-CHECK (M1 only — full dashboard & per-trade 6-line
