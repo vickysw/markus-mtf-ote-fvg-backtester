@@ -15,11 +15,12 @@
 //
 // Scope (per agreed $500 M2 breakdown, see status.md):
 //   5. Entry Trigger Selector (Direct Limit Touch / CISD) + Body Close
-//      Invalidation
-//   6. Stop Loss models: Option A (fixed 4H fib) / Option B (local 15m
-//      swing, incl. 1.1 extension per client 2026-09-28) / Option C (4H FVG
-//      boundary + buffer, per-asset units: pips/points/dollars per client
-//      2026-09-28)
+//      Invalidation (Option A/C). Option B (5b) has its own bespoke entry
+//      flow — see below.
+//   6. Stop Loss models: Option A (fixed 4H fib) / Option B (full FVG-touch
+//      -> CISD -> redraw flow, incl. 1.1 extension per client 2026-09-28) /
+//      Option C (4H FVG boundary + buffer, per-asset units:
+//      pips/points/dollars per client 2026-09-28)
 //   7. Dynamic position sizing (0.50% risk, binary set & forget)
 //   8. Final TP selector (0% / -0.27% / 5% / 10% / custom / 1R per client
 //      2026-09-28)
@@ -37,11 +38,13 @@
 //     is the standard interpretation but has NOT been cross-checked against
 //     client's own chart examples yet — recommend a validation step like
 //     M1's bias cross-check.
-//   - Stop Loss Option B: the full "Optimal Trade Entry.docx" redraw flow
-//     (4H FVG touch -> +CISD confirm -> -CISD break -> redraw local fib off
-//     new LL/HH -> entry 0.382) is NOT fully implemented here. Instead, the
-//     local 15m range is captured as the highest high / lowest low over a
-//     configurable lookback ending at the entry bar. Flagged for follow-up.
+//   - Stop Loss Option B (Section 5b): now implements the full "Optimal
+//     Trade Entry.docx" flow (4H FVG touch -> +CISD confirm -> -CISD break
+//     -> redraw local fib off new LL/HH -> entry 0.382), confirmed in scope
+//     2026-09-24 (no price change, see status.md "Scope check"). Built
+//     2026-09-30, NOT yet cross-checked against client's own chart examples
+//     from the docx — flag for a validation pass like M1's bias cross-check
+//     before calling this final.
 //   - Break-even state machine (Section 9): "CHoCH" and "1st/2nd BOS" are
 //     implemented as a single counter of consecutive same-direction LTF
 //     minor-pivot breaks since entry (CHoCH = break #1, 1st BOS = break #2,
@@ -325,6 +328,36 @@ killzoneUnmapped = sessionMode == "Per-Asset Killzone" and perAssetSession == "0
 setupCandidate = bias_tradeable and pdArrayGate and killzoneGate and liquidityGate
 
 // ============================================================================
+// 4b. 4H FVG DETECTOR — shared by SL Option B's entry flow (below) and
+//    Option C (Section 6). M1 only built a DAILY FVG, for the PD-array bias
+//    filter (Section 2), which is a different timeframe/purpose.
+// ============================================================================
+f_4h_fvg(_dir) =>
+    float top = na
+    float bot = na
+    if _dir == 1 and low > high[2]
+        top := low
+        bot := high[2]
+    else if _dir == -1 and high < low[2]
+        top := low[2]
+        bot := high
+    [top, bot]
+
+[fvg4hBullTop, fvg4hBullBot] = request.security(syminfo.tickerid, "240", f_4h_fvg(1), barmerge.gaps_off, barmerge.lookahead_off)
+[fvg4hBearTop, fvg4hBearBot] = request.security(syminfo.tickerid, "240", f_4h_fvg(-1), barmerge.gaps_off, barmerge.lookahead_off)
+
+var float lastBull4hFvgTop = na
+var float lastBull4hFvgBot = na
+var float lastBear4hFvgTop = na
+var float lastBear4hFvgBot = na
+if not na(fvg4hBullTop)
+    lastBull4hFvgTop := fvg4hBullTop
+    lastBull4hFvgBot := fvg4hBullBot
+if not na(fvg4hBearTop)
+    lastBear4hFvgTop := fvg4hBearTop
+    lastBear4hFvgBot := fvg4hBearBot
+
+// ============================================================================
 // 5. ENTRY TRIGGER & INVALIDATION
 // ============================================================================
 var string G_ENTRY = "5. Entry Trigger"
@@ -341,17 +374,41 @@ var bool  setupInvalid    = false
 var float cisdRefOpen     = na
 var bool  tradeTakenSwing = false
 
+// Option B's own entry-flow state (Section 5b below) — declared here so the
+// single swingChanged reset block below can cover both flows together.
+var int   optB_phase        = 0     // 0 idle, 1 armed (+CISD confirmed), 2 redrawn (ready to enter)
+var float optB_cisdOpen     = na    // reference open for the +CISD confirm
+var float optB_failOpen     = na    // reference open for the -CISD fail/break
+var float optB_swingExtreme = na    // running extreme tracked while armed (phase 1)
+var float optB_localHigh    = na    // redrawn local fib anchor (recent high for long / low for short... see 5b)
+var float optB_localLow     = na    // redrawn local fib anchor (new low for long / high for short... see 5b)
+
 if swingChanged
+    // Real bug found via QA 2026-09-30: if an order was ALREADY submitted
+    // (tradeTakenSwing true) and is still pending/unfilled when the swing
+    // changes again, resetting state here let a brand-new signal cycle start
+    // and later call strategy.entry() with the SAME id ("Long"/"Short") —
+    // which silently OVERWRITES the still-pending order's price/qty instead
+    // of creating a new one, while the old debug label stays on the chart
+    // showing now-stale numbers that no longer match what actually filled.
+    // Cancel here — but ONLY when an order was genuinely already submitted —
+    // so a fresh setup starting later gets a clean order, not a clobbered
+    // one. This is narrower than the earlier (reverted) blanket cancel-on-
+    // swingChanged attempt, which cancelled orders that had NOT yet been
+    // submitted and killed genuinely-still-forming setups.
+    if tradeTakenSwing
+        strategy.cancel("Long")
+        strategy.cancel("Short")
     zoneTouched     := false
     setupInvalid    := false
     cisdRefOpen      := na
     tradeTakenSwing := false
-    // NOTE: deliberately does NOT cancel pending orders here — swingChanged
-    // fires on every new 4H pivot tick (common, not necessarily a real
-    // invalidation), and cancelling a still-live Direct Limit Touch order on
-    // that alone killed genuinely-still-valid pending trades during QA
-    // 2026-09-30. Order cancellation is tied to setupInvalid below instead,
-    // which is the spec's own defined invalidation event.
+    optB_phase        := 0
+    optB_cisdOpen     := na
+    optB_failOpen     := na
+    optB_swingExtreme := na
+    optB_localHigh    := na
+    optB_localLow     := na
 
 inZone = not na(entryPrice) and not na(deepBoundary) and setupCandidate and (biasDir == 1 ? (low <= entryPrice and close >= deepBoundary) : biasDir == -1 ? (high >= entryPrice and close <= deepBoundary) : false)
 
@@ -383,6 +440,70 @@ cisdTriggered = not na(cisdRefOpen) and (biasDir == 1 ? close > cisdRefOpen : bi
 entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
 
 // ============================================================================
+// 5b. STOP LOSS OPTION B — FULL ENTRY FLOW (per client's Optimal Trade
+//    Entry.docx, confirmed in scope 2026-09-24, no price change — see
+//    status.md "Scope check"). Replaces the earlier simplified local-range
+//    placeholder. Only takes effect when Stop Loss Model = Option B (chosen
+//    in Section 6 below) — Option A/C keep using Section 5's generic zone
+//    touch/CISD entry above.
+//
+//    Flow: 1) price touches the 4H FVG in the bias direction
+//          2) +CISD confirms (first same-direction reversal candle)
+//          3) -CISD breaks (that confirm FAILS — price reverses again)
+//          4) redraw a local fib from the new extreme formed during that
+//             failed excursion to the recent high/low reached while armed
+//          5) enter at the 0.382 level of that redrawn local fib
+//
+//    NOTE: step 3's "failure" is part of the intended trigger sequence
+//    itself, not a dead setup — the false reversal is what creates the local
+//    swing to trade off. Not yet cross-checked against client's own chart
+//    examples from the docx — flag for validation, same as M1's bias
+//    cross-check.
+// ============================================================================
+touched4hFvg = setupCandidate and (biasDir == 1 ? (not na(lastBull4hFvgTop) and low <= lastBull4hFvgTop) : biasDir == -1 ? (not na(lastBear4hFvgBot) and high >= lastBear4hFvgBot) : false)
+
+if setupCandidate and (biasDir == 1 or biasDir == -1)
+    // Phase 0 -> 1: price touches the 4H FVG, then a same-direction reversal
+    // candle confirms (+CISD) — same idea as Section 5's CISD, scoped here to
+    // the FVG touch specifically.
+    if optB_phase == 0 and touched4hFvg
+        if biasDir == 1 and close < open
+            optB_cisdOpen := open
+        else if biasDir == -1 and close > open
+            optB_cisdOpen := open
+        if not na(optB_cisdOpen) and (biasDir == 1 ? close > optB_cisdOpen : close < optB_cisdOpen)
+            optB_phase        := 1
+            optB_localHigh    := biasDir == 1 ? high : na
+            optB_localLow     := biasDir == -1 ? low : na
+            optB_swingExtreme := biasDir == 1 ? low : high
+
+    // Phase 1 (armed): track the running extreme, and the recent high/low
+    // reached while armed (the OTHER anchor of the eventual redrawn fib),
+    // watching for the -CISD break (the +CISD confirm failing).
+    if optB_phase == 1
+        optB_swingExtreme := biasDir == 1 ? math.min(optB_swingExtreme, low) : math.max(optB_swingExtreme, high)
+        if biasDir == 1
+            optB_localHigh := math.max(optB_localHigh, high)
+        else
+            optB_localLow := math.min(optB_localLow, low)
+        if biasDir == 1 and close > open
+            optB_failOpen := open
+        else if biasDir == -1 and close < open
+            optB_failOpen := open
+        if not na(optB_failOpen) and (biasDir == 1 ? close < optB_failOpen : close > optB_failOpen)
+            // -CISD break confirmed: redraw the local fib off the new
+            // extreme reached during this failed excursion (already the
+            // running min/max tracked above, current bar included).
+            if biasDir == 1
+                optB_localLow := optB_swingExtreme
+            else
+                optB_localHigh := optB_swingExtreme
+            optB_phase := 2
+
+optB_localRange = not na(optB_localHigh) and not na(optB_localLow) ? optB_localHigh - optB_localLow : na
+optB_entryPrice = optB_phase == 2 and not na(optB_localRange) ? (biasDir == 1 ? optB_localHigh - 0.382 * optB_localRange : optB_localLow + 0.382 * optB_localRange) : na
+
+// ============================================================================
 // 6. STOP LOSS MODELS (Option A / B / C)
 // ============================================================================
 var string G_SL = "6. Stop Loss Model"
@@ -393,43 +514,14 @@ slOptionA_level = input.float(1.00, "Option A: SL Fib Level", options=[0.79, 0.8
 slA_price = biasDir == 1 ? swHigh - slOptionA_level * (swHigh - swLow) : biasDir == -1 ? swLow + slOptionA_level * (swHigh - swLow) : na
 
 // ---- Option B: local 15m swing extension ----
-// Simplified per header note: captures the local 15m range as the highest
-// high / lowest low over a lookback ending at the current bar (i.e. at the
-// entry trigger bar), NOT the full FVG-touch -> +CISD -> -CISD -> redraw flow.
-localSwingLen  = input.int(10, "Option B: Local 15m Swing Lookback (bars)", minval=2, group=G_SL)
+// Uses the redrawn local fib from Section 5b's full entry-flow state machine
+// (FVG touch -> +CISD -> -CISD fail -> redraw), per client's Optimal Trade
+// Entry.docx — NOT a generic lookback window.
 slOptionB_mult = input.float(1.30, "Option B: Local SL Extension Multiplier", options=[1.10, 1.20, 1.30, 1.40, 1.50], group=G_SL)
-localHigh  = ta.highest(high, localSwingLen)
-localLow   = ta.lowest(low, localSwingLen)
-localRange = localHigh - localLow
-slB_price  = biasDir == 1 ? localLow - (slOptionB_mult - 1.0) * localRange : biasDir == -1 ? localHigh + (slOptionB_mult - 1.0) * localRange : na
+slB_price  = optB_phase == 2 and not na(optB_localRange) ? (biasDir == 1 ? optB_localLow - (slOptionB_mult - 1.0) * optB_localRange : optB_localHigh + (slOptionB_mult - 1.0) * optB_localRange) : na
 
 // ---- Option C: 4H FVG boundary + pips/points/$ buffer ----
-// Needs its own 4H FVG detector (M1 only built a DAILY FVG, for the PD-array
-// bias filter — Section 2 above — which is a different timeframe/purpose).
-f_4h_fvg(_dir) =>
-    float top = na
-    float bot = na
-    if _dir == 1 and low > high[2]
-        top := low
-        bot := high[2]
-    else if _dir == -1 and high < low[2]
-        top := low[2]
-        bot := high
-    [top, bot]
-
-[fvg4hBullTop, fvg4hBullBot] = request.security(syminfo.tickerid, "240", f_4h_fvg(1), barmerge.gaps_off, barmerge.lookahead_off)
-[fvg4hBearTop, fvg4hBearBot] = request.security(syminfo.tickerid, "240", f_4h_fvg(-1), barmerge.gaps_off, barmerge.lookahead_off)
-
-var float lastBull4hFvgTop = na
-var float lastBull4hFvgBot = na
-var float lastBear4hFvgTop = na
-var float lastBear4hFvgBot = na
-if not na(fvg4hBullTop)
-    lastBull4hFvgTop := fvg4hBullTop
-    lastBull4hFvgBot := fvg4hBullBot
-if not na(fvg4hBearTop)
-    lastBear4hFvgTop := fvg4hBearTop
-    lastBear4hFvgBot := fvg4hBearBot
+// (4H FVG detector now lives in Section 4b, shared with Option B's Section 5b)
 
 // Per-asset buffer unit conversion (client-confirmed 2026-09-28): pips for
 // forex, points for indices, dollars for XAUUSD.
@@ -447,16 +539,28 @@ bufferPrice = f_buffer_price_units(slOptionC_buffer)
 slC_price = biasDir == 1 ? (not na(lastBull4hFvgBot) ? lastBull4hFvgBot : swLow) - bufferPrice : biasDir == -1 ? (not na(lastBear4hFvgTop) ? lastBear4hFvgTop : swHigh) + bufferPrice : na
 
 activeSL = slModel == "Option A: Fixed 4H Fib" ? slA_price : slModel == "Option B: Local 15m Swing Extension" ? slB_price : slC_price
-// Actual fill price used for risk math — NOT always the same as entryPrice.
-// Direct Limit Touch submits a real limit order at entryPrice (see Section
-// 10), so it fills there. CISD Confirmation fires on a body-close event, and
-// with process_orders_on_close=true a market order submitted that bar fills
-// at that bar's close — so risk sizing must anchor to `close`, not the
-// (possibly several-bars-stale) fib touch price, or 0.50% risk drifts.
+
+// Option B has its own bespoke entry trigger/price (Section 5b's redrawn
+// 0.382 level) — it overrides Section 5's generic zone-touch/CISD entry
+// entirely when selected, and is always treated as a limit order (the
+// confirm/fail/redraw sequence already IS the confirmation; no separate
+// CISD-vs-limit choice on top of it).
+usingOptionB      = slModel == "Option B: Local 15m Swing Extension"
+activeEntryPrice  = usingOptionB ? optB_entryPrice : entryPrice
+activeEntrySignal = usingOptionB ? (optB_phase == 2 and setupCandidate and not tradeTakenSwing) : entrySignal
+activeIsLimitEntry = usingOptionB or entryTriggerMode == "Direct Limit Touch"
+
+// Actual fill price used for risk math — NOT always the same as
+// activeEntryPrice. A limit order (Direct Limit Touch, or Option B's redrawn
+// 0.382 level) fills exactly there. CISD Confirmation (non-Option-B) fires on
+// a body-close event, and with process_orders_on_close=true a market order
+// submitted that bar fills at that bar's close — so risk sizing must anchor
+// to `close`, not the (possibly several-bars-stale) fib touch price, or
+// 0.50% risk drifts.
 // Found via QA 2026-09-29/30: a Direct-Limit-Touch trade filled ~$7.7 away
 // from its fib level because the old code sized/priced off entryPrice while
 // actually entering with a plain market order (filled at bar close).
-fillPrice  = entryTriggerMode == "Direct Limit Touch" ? entryPrice : close
+fillPrice  = activeIsLimitEntry ? activeEntryPrice : close
 slDistance = not na(fillPrice) and not na(activeSL) ? math.abs(fillPrice - activeSL) : na
 
 // ============================================================================
@@ -552,25 +656,25 @@ else
 // ============================================================================
 // 10. STRATEGY EXECUTION
 // ============================================================================
-longCondition  = entrySignal and biasDir == 1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
-shortCondition = entrySignal and biasDir == -1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
+longCondition  = activeEntrySignal and biasDir == 1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
+shortCondition = activeEntrySignal and biasDir == -1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
 
-// Direct Limit Touch = a real limit order at entryPrice (matches the spec's
-// own wording), so it fills at the intended fib level rather than at the
-// signal bar's close. CISD Confirmation stays a market order, since the
-// trigger IS a close-based confirmation event — fillPrice above already
-// anchors its risk math to that close, not the stale fib touch price.
+// A limit order (Direct Limit Touch, or Option B's redrawn 0.382 level)
+// fills at the intended price rather than at the signal bar's close. CISD
+// Confirmation (non-Option-B) stays a market order, since the trigger IS a
+// close-based confirmation event — fillPrice above already anchors its risk
+// math to that close, not the stale fib touch price.
 if longCondition
-    if entryTriggerMode == "Direct Limit Touch"
-        strategy.entry("Long", strategy.long, qty=tradeQty, limit=entryPrice)
+    if activeIsLimitEntry
+        strategy.entry("Long", strategy.long, qty=tradeQty, limit=activeEntryPrice)
     else
         strategy.entry("Long", strategy.long, qty=tradeQty)
     strategy.exit("Exit Long", from_entry="Long", stop=activeSL, limit=tpPrice)
     tradeTakenSwing := true
 
 if shortCondition
-    if entryTriggerMode == "Direct Limit Touch"
-        strategy.entry("Short", strategy.short, qty=tradeQty, limit=entryPrice)
+    if activeIsLimitEntry
+        strategy.entry("Short", strategy.short, qty=tradeQty, limit=activeEntryPrice)
     else
         strategy.entry("Short", strategy.short, qty=tradeQty)
     strategy.exit("Exit Short", from_entry="Short", stop=activeSL, limit=tpPrice)
@@ -592,13 +696,14 @@ if not na(fibZoneTop) and not na(fibZoneBot)
 
 plotchar(setupCandidate, "Setup Candidate (M1 checks passed)", "▲", location.belowbar, color=color.lime, size=size.tiny)
 plotchar(eqlDetected, "EQL Detected", "×", location.abovebar, color=color.red, size=size.tiny)
-plotchar(entrySignal, "Entry Trigger Fired", "●", location.belowbar, color=color.yellow, size=size.tiny)
+plotchar(activeEntrySignal, "Entry Trigger Fired", "●", location.belowbar, color=color.yellow, size=size.tiny)
+plotchar(optB_phase == 1, "Option B Armed (+CISD confirmed, watching for -CISD break)", "○", location.belowbar, color=color.orange, size=size.tiny)
 
 // Per-entry debug label (QA only): prints SL/TP/qty AT the moment of entry,
 // on every historical trade — not just the most recent bar like the summary
 // label below — so a specific past trade can be checked individually.
 if showDebug and (longCondition or shortCondition)
-    dbgEntryTxt = (longCondition ? "LONG " : "SHORT ") + "fibLevel=" + str.tostring(entryPrice, "#.###") + " fill=" + str.tostring(fillPrice, "#.###") + " SL=" + str.tostring(activeSL, "#.###") + " TP=" + str.tostring(tpPrice, "#.###") + " qty=" + str.tostring(tradeQty, "#.####")
+    dbgEntryTxt = (longCondition ? "LONG " : "SHORT ") + (usingOptionB ? "optB_redraw=" : "fibLevel=") + str.tostring(activeEntryPrice, "#.###") + " fill=" + str.tostring(fillPrice, "#.###") + " SL=" + str.tostring(activeSL, "#.###") + " TP=" + str.tostring(tpPrice, "#.###") + " qty=" + str.tostring(tradeQty, "#.####") + " equity=" + str.tostring(strategy.equity, "#.##") + " risk$=" + str.tostring(riskAmount, "#.##")
     label.new(bar_index, longCondition ? low - mainAtr : high + mainAtr, dbgEntryTxt, style=longCondition ? label.style_label_up : label.style_label_down, color=color.blue, textcolor=color.white, size=size.small)
 
 var label biasLbl = na
