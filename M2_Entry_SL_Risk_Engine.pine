@@ -48,7 +48,10 @@
 //   - Break-even state machine (Section 9): "CHoCH" and "1st/2nd BOS" are
 //     implemented as a single counter of consecutive same-direction LTF
 //     minor-pivot breaks since entry (CHoCH = break #1, 1st BOS = break #2,
-//     2nd BOS = break #3). Needs client cross-check against real examples.
+//     2nd BOS = break #3). Reset-on-wrong-direction rule confirmed correct
+//     against client's Optimal Trade Entry.docx (image 9) 2026-09-30.
+//     CHoCH pivot sensitivity confirmed by client 2026-09-30: dynamic 3-10,
+//     default 6 (8 if TP R:R > 4).
 //   - Position sizing (Section 7) computes qty as risk-amount / SL-distance
 //     in raw price units of the instrument. This matches how Strategy
 //     Tester sizes contracts on most FX/CFD/index tickers, but has not been
@@ -606,7 +609,7 @@ tpPrice = biasDir == 1 ?
 // off the latest structure.
 var string G_BE = "9. Break-Even"
 beMode          = input.string("Option A: After LTF CHoCH", "Break-Even Trigger", options=["Option A: After LTF CHoCH", "Option B: After 1st BOS", "Option C: After 2nd BOS"], group=G_BE)
-beLtfPivotLen   = input.int(3, "BE: LTF Pivot Length", minval=1, group=G_BE, tooltip="Pivot length on THIS chart's own timeframe (intended 15m) used to detect minor structure breaks for BE purposes")
+beLtfPivotLen   = input.int(6, "BE CHoCH Sensitivity (LTF Pivot Bars)", minval=3, maxval=10, group=G_BE, tooltip="Pivot length on THIS chart's own timeframe (intended 15m) used to detect a genuine CHoCH for BE purposes. Per client 2026-09-30: keep dynamic 3-10, default 6. If running a TP R:R higher than 4, consider 8.")
 
 ph_ltf = ta.pivothigh(high, beLtfPivotLen, beLtfPivotLen)
 pl_ltf = ta.pivotlow(low, beLtfPivotLen, beLtfPivotLen)
