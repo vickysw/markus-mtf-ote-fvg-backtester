@@ -1,0 +1,696 @@
+// ============================================================================
+// Markus — Multi-Timeframe OTE & FVG Backtester
+// M1+M2 COMBINED — Structure Stop / 4H-FVG-Anchored Engine
+// (DRAFT — not yet compiled or client-reviewed)
+//
+// SUPERSEDES M1_Foundation_Bias_Engine.pine + M2_Entry_SL_Risk_Engine.pine.
+// Built 2026-10-02 per 3 client messages requesting changes to the swing/fib
+// foundation (M1 Section 1/2), which M1 was already approved and paid for
+// (2026-09-29). Per status.md decision 2026-10-02: client acknowledged these
+// are M1-level changes, built as a goodwill revision rather than a new paid
+// item.
+//
+// WHAT CHANGED vs the approved M1/M2:
+//   1. "Structure Stop" swing/fib anchoring (NEW, replaces fixed-lookback
+//      pivot swing entirely): a 4H FVG is now the TRIGGER for the whole fib
+//      zone. On a valid 4H FVG, scan backward bar-by-bar for the most recent
+//      minor swing point broken by the move (the MSS/CHoCH origin), stop the
+//      scan there, and anchor Fib 100% at the lowest/highest wick between
+//      that break point and the FVG. The old "4H Swing Pivot Length" fixed
+//      lookback is gone.
+//   2. Daily PD-Array filter REMOVED entirely (f_daily_fvg, f_daily_ob,
+//      pdArrayMode, pdArrayGate) — client confirmed 2026-10-02 he does not
+//      use Daily FVG/OB at all; his system is 4H-only. bias_tradeable no
+//      longer requires a PD-array check.
+//   3. Strict 4H FVG validity rules, applied everywhere a 4H FVG is used
+//      (Structure Stop anchor, Option B's entry flow, Option C's SL):
+//      - Displacement: candle 2's body >= 70% of its high-low range
+//        (fvgDispRatio input, default 0.70).
+//      - Minimum size: gap >= ATR(14) x fvg_min_atr_pct (input, default
+//        0.20, range 0.05-1.0) — exact per client spec.
+//      - Mitigation: an FVG is only valid while completely untouched since
+//        it formed. The first bar price trades back into it, it's discarded
+//        (fvgMitigated) and the engine waits for the next qualifying FVG.
+//
+// KNOWN ASSUMPTIONS — flag to client, same pattern as every prior ambiguous
+// spec item in this project:
+//   - "Minor Swing High/Low" (for the backward MSS scan) pivot length is NOT
+//     specified by the client. Defaulted to 3 bars (minorSwingPivotLen
+//     input), exposed and tunable. Needs his review.
+//   - Backward scan is capped at structureScanCap bars (default 500, ~83
+//     days on 4H) as a safety/performance limit — not in the client's spec,
+//     added so a pathological chart can't trigger a runaway loop. In normal
+//     use this should essentially never bind.
+//   - Mitigation rule (message 3, point 3) was worded as "FVG must remain
+//     untouched until price retraces into the Fib Entry Level" — interpreted
+//     here as the standard ICT "fresh/untested FVG" concept (any touch since
+//     formation invalidates it), since the FVG is expected to sit at/near
+//     the fib entry zone it anchors. Flagged in case his intent was a
+//     stricter/different two-zone check.
+//   - swHighTime/swLowTime collapsed into a single swTime (both ends of the
+//     swing now update together, since one FVG event produces both anchors
+//     at once) — functionally equivalent for the existing swingChanged logic.
+//
+// Everything below this is otherwise IDENTICAL in scope/behavior to the
+// approved M1 (bias engine, EQL filter, killzone/session) and approved-
+// pending-payment M2 (entry trigger, all 3 SL models, position sizing, TP,
+// break-even state machine) — see M1_Foundation_Bias_Engine.pine and
+// M2_Entry_SL_Risk_Engine.pine headers/status.md for that history.
+// ============================================================================
+
+//@version=5
+strategy("Markus MTF OTE/FVG — Structure Stop Engine", shorttitle="Markus M1+M2", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, default_qty_type=strategy.fixed, initial_capital=10000, currency=currency.USD, commission_type=strategy.commission.percent, commission_value=0.0, process_orders_on_close=true)
+
+// ============================================================================
+// 0. DEBUG (QA only — leave off for normal use)
+// ============================================================================
+var string G_DEBUG = "0. Debug"
+showDebug = input.bool(false, "Show Debug Label (swHigh/swLow/fibZone/SL/TP values)", group=G_DEBUG, tooltip="For QA cross-checking against a manually-drawn fib tool. Leave off for normal use.")
+
+// ============================================================================
+// 1. FIBONACCI & ENTRY ZONE — now driven by Structure Stop (4H-FVG-anchored)
+// ============================================================================
+var string G_FIB = "1. Fibonacci & Entry Zone"
+fibEntryLevel = input.float(0.705, "Fib Entry Level", options=[0.5, 0.62, 0.66, 0.705, 0.79], group=G_FIB)
+allowDeepZone = input.bool(true, "Allow 0.79 Deep OTE Zone", group=G_FIB, tooltip="If false, the deep boundary of the entry band is capped at 0.705 instead of 0.79")
+
+var string G_STRUCT = "1b. Structure Stop (4H FVG Anchoring)"
+minorSwingPivotLen = input.int(3, "Minor Swing Pivot Length (4H bars)", minval=1, group=G_STRUCT, tooltip="Pivot length used to find candidate MSS/CHoCH swing points for the backward scan. NOT specified by client — defaulted small, needs his review.")
+fvgDispRatio        = input.float(0.70, "4H FVG: Min Displacement Body Ratio", minval=0.50, maxval=0.95, step=0.05, group=G_STRUCT, tooltip="Candle 2's body must be at least this fraction of its high-low range for the FVG to count as a valid expansion (client spec: 0.70)")
+fvgMinAtrPct         = input.float(0.20, "4H FVG: Min Gap Size (x ATR14)", minval=0.05, maxval=1.0, step=0.05, group=G_STRUCT, tooltip="FVG gap must be at least this fraction of 4H ATR(14) to filter noise (client spec: default 0.20, range 0.05-1.0)")
+structureScanCap     = input.int(500, "Structure Stop: Max Backward Scan (4H bars)", minval=50, group=G_STRUCT, tooltip="Safety cap on how far back the MSS/CHoCH scan can look — not in client spec, prevents a runaway loop on a pathological chart. Should rarely/never bind in normal use.")
+
+// Finds the most recent valid 4H FVG in direction _dir, then scans backward
+// for the minor swing point it broke (MSS/CHoCH origin), and anchors the
+// fib's 100% end at the extreme wick between that break and the FVG. Also
+// tracks FVG mitigation (any touch since formation invalidates it). Called
+// twice below (bull/bear) — each call site gets its own independent `var`
+// state, same proven pattern as f_smc_choch_trend's two calls elsewhere in
+// this file.
+f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
+    bodyRatio = math.abs(close[1] - open[1]) / (high[1] - low[1])
+    atrv = ta.atr(14)
+    fvgNow = _dir == 1 ? (low > high[2] and bodyRatio >= _dispRatio and (low - high[2]) >= atrv * _minAtrPct) : (high < low[2] and bodyRatio >= _dispRatio and (low[2] - high) >= atrv * _minAtrPct)
+
+    var float[] minorPivs    = array.new_float(0)
+    var int[]   minorPivBars = array.new_int(0)
+    piv = _dir == 1 ? ta.pivothigh(high, _minorPivLen, _minorPivLen) : ta.pivotlow(low, _minorPivLen, _minorPivLen)
+    if not na(piv)
+        array.push(minorPivs, piv)
+        array.push(minorPivBars, bar_index - _minorPivLen)
+        if array.size(minorPivs) > 150
+            array.shift(minorPivs)
+            array.shift(minorPivBars)
+
+    var float swAnchor     = na   // the broken minor pivot — Fib 0% side
+    var float swExtreme    = na   // lowest/highest wick in the block — Fib 100% side
+    var int   swTime       = na
+    var float fvgTop       = na
+    var float fvgBot       = na
+    var bool  fvgMitigated = false
+
+    if fvgNow
+        fvgTop := _dir == 1 ? low : low[2]
+        fvgBot := _dir == 1 ? high[2] : high
+        fvgMitigated := false
+        float foundPiv = na
+        int   foundBar = na
+        if array.size(minorPivs) > 0
+            for i = array.size(minorPivs) - 1 to 0
+                p_i = array.get(minorPivs, i)
+                b_i = array.get(minorPivBars, i)
+                if (bar_index - b_i) > _scanCap
+                    break
+                broken = _dir == 1 ? close > p_i : close < p_i
+                if broken
+                    foundPiv := p_i
+                    foundBar := b_i
+                    break
+        if not na(foundPiv)
+            barsBack = bar_index - foundBar
+            swAnchor  := foundPiv
+            swExtreme := _dir == 1 ? ta.lowest(low, barsBack + 1) : ta.highest(high, barsBack + 1)
+            swTime    := time
+    else if not na(fvgTop) and not fvgMitigated
+        touched = _dir == 1 ? (low <= fvgTop) : (high >= fvgBot)
+        if touched
+            fvgMitigated := true
+            swAnchor  := na
+            swExtreme := na
+
+    swHigh = _dir == 1 ? swAnchor : swExtreme
+    swLow  = _dir == 1 ? swExtreme : swAnchor
+    [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated]
+
+[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ============================================================================
+// 2. HTF BIAS ENGINE — ported unchanged from client's BIAS_3_Filter.pine;
+//    Level 1 = strictest ... Level 3 = loosest. Daily PD-Array filter
+//    REMOVED per client 2026-10-02 (he does not use Daily FVG/OB at all).
+// ============================================================================
+var string G_BIAS = "2. HTF Bias"
+dailyExtLen  = input.int(20, "Daily External Pivot Length", minval=2, group=G_BIAS)
+dailyIntLen  = input.int(5, "Daily Internal Pivot Length", minval=2, group=G_BIAS)
+biasMinLevel = input.string("Level 2", "Minimum Bias Level to Trade", options=["Off (No Bias Filter)", "Level 1", "Level 2", "Level 3", "Walkaway (halt all)"], group=G_BIAS, tooltip="Off = ignore the Level requirement entirely (analysis-sheet Test 1A control group — any detected direction is tradeable). Level 1 = A+ only (strictest, fewest trades). Level 3 = accept Level 1/2/3 (loosest). Walkaway = manual kill-switch, no trades regardless of engine state.")
+
+f_smc_choch_trend(_len) =>
+    p_high = ta.pivothigh(high, _len, _len)
+    p_low  = ta.pivotlow(low, _len, _len)
+    var float last_high = na
+    var float last_low  = na
+    var int trend = 0
+    if not na(p_high)
+        last_high := p_high
+    if not na(p_low)
+        last_low := p_low
+    if not na(last_high) and close > last_high
+        trend := 1
+        last_high := na
+    else if not na(last_low) and close < last_low
+        trend := -1
+        last_low := na
+    trend
+
+daily_ext = request.security(syminfo.tickerid, "D", f_smc_choch_trend(dailyExtLen), barmerge.gaps_off, barmerge.lookahead_off)
+daily_int = request.security(syminfo.tickerid, "D", f_smc_choch_trend(dailyIntLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+f_weekly_dna() =>
+    w_open1  = open[1]
+    w_close1 = close[1]
+    w_high1  = high[1]
+    w_low1   = low[1]
+    w_open2  = open[2]
+    w_close2 = close[2]
+    w_high2  = high[2]
+    w_low2   = low[2]
+    prev_body_high = math.max(w_open2, w_close2)
+    prev_body_low  = math.min(w_open2, w_close2)
+    is_bull = (w_close1 > w_open1) and ((w_open1 < w_low2 and w_close1 > w_high2) or (w_close1 > prev_body_high) or (w_low1 < w_low2 and w_close1 > prev_body_high))
+    is_bear = (w_close1 < w_open1) and ((w_open1 > w_high2 and w_close1 < w_low2) or (w_close1 < prev_body_low) or (w_high1 > w_high2 and w_close1 < prev_body_low))
+    is_bull ? 1 : is_bear ? -1 : 0
+
+weekly_bias = request.security(syminfo.tickerid, "W", f_weekly_dna(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Level / direction classification — exact mapping from client's own script
+var int biasLevel = 0   // 1 = A+, 2 = Standard, 3 = Neutral Macro, 0 = Walkaway
+var int biasDir   = 0   // 1 = long, -1 = short, 0 = none
+
+if weekly_bias == 1 and daily_ext == 1 and daily_int == 1
+    biasLevel := 1
+    biasDir   := 1
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == -1
+    biasLevel := 1
+    biasDir   := -1
+else if weekly_bias == 1 and daily_ext == 1 and daily_int == -1
+    biasLevel := 2
+    biasDir   := 1
+else if weekly_bias == -1 and daily_ext == -1 and daily_int == 1
+    biasLevel := 2
+    biasDir   := -1
+else if weekly_bias == 0 and daily_ext == 1
+    biasLevel := 3
+    biasDir   := 1
+else if weekly_bias == 0 and daily_ext == -1
+    biasLevel := 3
+    biasDir   := -1
+else
+    biasLevel := 0
+    biasDir   := 0
+
+minLevelNum    = biasMinLevel == "Level 1" ? 1 : biasMinLevel == "Level 2" ? 2 : biasMinLevel == "Level 3" ? 3 : 99
+bias_tradeable = biasMinLevel == "Off (No Bias Filter)" ? biasDir != 0 : biasLevel != 0 and biasLevel <= minLevelNum
+if biasMinLevel == "Walkaway (halt all)"
+    bias_tradeable := false
+
+// ============================================================================
+// 2b. SWING / FVG SELECTION + FIB ZONE — picks the bull or bear Structure
+//     Stop result based on biasDir (computed above), then builds the entry
+//     zone exactly as before.
+// ============================================================================
+swHigh   = biasDir == 1 ? swHighBull : biasDir == -1 ? swHighBear : na
+swLow    = biasDir == 1 ? swLowBull  : biasDir == -1 ? swLowBear  : na
+swTime   = biasDir == 1 ? swTimeBull : biasDir == -1 ? swTimeBear : na
+activeFvgTop       = biasDir == 1 ? fvgTopBull       : biasDir == -1 ? fvgTopBear       : na
+activeFvgBot       = biasDir == 1 ? fvgBotBull       : biasDir == -1 ? fvgBotBear       : na
+activeFvgMitigated = biasDir == 1 ? fvgMitigatedBull : biasDir == -1 ? fvgMitigatedBear : true
+
+// entry-zone band (fibEntryLevel .. deep boundary), anchored off the
+// Structure Stop swing, in bias direction
+float fibZoneTop = na
+float fibZoneBot = na
+if biasDir == 1 and not na(swHigh) and not na(swLow)
+    fibZoneTop := swHigh - fibEntryLevel * (swHigh - swLow)
+    fibZoneBot := swHigh - (allowDeepZone ? 0.79 : 0.705) * (swHigh - swLow)
+else if biasDir == -1 and not na(swHigh) and not na(swLow)
+    fibZoneBot := swLow + fibEntryLevel * (swHigh - swLow)
+    fibZoneTop := swLow + (allowDeepZone ? 0.79 : 0.705) * (swHigh - swLow)
+
+// ============================================================================
+// 3. LIQUIDITY / EQL DETECTION FILTER   (unchanged)
+// ============================================================================
+var string G_LIQ = "3. Liquidity / EQL Filter"
+eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = reject setup if equal-lows/highs (double bottom/top) liquidity sits at the swing origin. ON = allow trade anyway, for winrate A/B comparison.")
+eqlPivotLen    = input.int(7, "EQL Pivot Length (4H bars)", minval=2, group=G_LIQ, tooltip="Independent of the Structure Stop minor-pivot length — controls only how sensitive EQL's own minor-pivot detection is, does not affect the macro fib-zone swing")
+eqlAtrSens     = input.float(0.10, "EQL ATR Sensitivity", minval=0.01, step=0.01, group=G_LIQ, tooltip="Max distance, in ATR, between two PIVOT lows/highs to count as 'equal' liquidity (double bottom/top)")
+eqlPivotDepth  = input.int(5, "EQL Pivot History Depth", minval=1, maxval=20, group=G_LIQ, tooltip="How many prior EQL pivots to compare each new pivot against")
+
+f_eql_scan(_pivotLen, _sensMult, _maxPivots) =>
+    pl = ta.pivotlow(low, _pivotLen, _pivotLen)
+    ph = ta.pivothigh(high, _pivotLen, _pivotLen)
+    var float[] lowPivots  = array.new_float(0)
+    var float[] highPivots = array.new_float(0)
+    var bool eqlLowState  = false
+    var bool eqlHighState = false
+    atrv = ta.atr(14)
+    if not na(pl)
+        bool hit = false
+        if array.size(lowPivots) > 0
+            for i = 0 to array.size(lowPivots) - 1
+                if math.abs(array.get(lowPivots, i) - pl) <= atrv * _sensMult
+                    hit := true
+        eqlLowState := hit
+        array.push(lowPivots, pl)
+        if array.size(lowPivots) > _maxPivots
+            array.shift(lowPivots)
+    if not na(ph)
+        bool hit = false
+        if array.size(highPivots) > 0
+            for i = 0 to array.size(highPivots) - 1
+                if math.abs(array.get(highPivots, i) - ph) <= atrv * _sensMult
+                    hit := true
+        eqlHighState := hit
+        array.push(highPivots, ph)
+        if array.size(highPivots) > _maxPivots
+            array.shift(highPivots)
+    [eqlLowState, eqlHighState]
+
+[eqlAtSwingLow, eqlAtSwingHigh] = request.security(syminfo.tickerid, "240", f_eql_scan(eqlPivotLen, eqlAtrSens, eqlPivotDepth), barmerge.gaps_off, barmerge.lookahead_off)
+
+eqlDetected   = biasDir == 1 ? eqlAtSwingLow : biasDir == -1 ? eqlAtSwingHigh : false
+liquidityGate = eqlAllowToggle ? true : not eqlDetected
+
+// ============================================================================
+// 4. KILLZONE / SESSION FILTER   (unchanged)
+// ============================================================================
+var string G_SESSION = "4. Killzone / Session Filter"
+useKillzone = input.bool(true, "Restrict Entries to Killzone", group=G_SESSION)
+sessionMode = input.string("Per-Asset Killzone", "Session Mode", options=["Per-Asset Killzone", "London", "New York", "Combined (London+NY)", "Asian", "Dead Hours"], group=G_SESSION, tooltip="Per-Asset Killzone = each symbol's own window below (Killzones.docx). The other 5 are fixed windows, same for every asset, for the analysis-sheet's Base Test 2 (time-of-day volume analysis).")
+
+f_killzone_session() =>
+    t = syminfo.ticker
+    string sess = switch
+        t == "EURUSD" => "0800-1640"
+        t == "GBPUSD" => "0800-1640"
+        t == "AUDUSD" => "0800-1640,0030-0530"
+        t == "NZDUSD" => "0800-1640,0030-0530"
+        t == "EURJPY" => "0830-1130"
+        t == "GBPJPY" => "0830-1130"
+        t == "XAUUSD" => "0830-1130,1530-1900"
+        t == "USTEC100" or t == "NAS100" or t == "US100" or t == "USTEC" => "1530-1900"
+        t == "SPX500" or t == "US500" or t == "SP500" or t == "SPX" => "1530-1900"
+        t == "US30" or t == "DJ30" => "1530-1900"
+        => "0000-2359"
+    sess
+
+f_fixed_session(_mode) =>
+    string sess = switch _mode
+        "London"                => "0800-1100"
+        "New York"               => "1400-1700"
+        "Combined (London+NY)"  => "0800-1100,1400-1700"
+        "Asian"                  => "0100-0500"
+        "Dead Hours"             => "1100-1400"
+        => "0000-2359"
+    sess
+
+perAssetSession  = f_killzone_session()
+killzoneSession  = sessionMode == "Per-Asset Killzone" ? perAssetSession : f_fixed_session(sessionMode)
+inKillzone       = not na(time(timeframe.period, killzoneSession, "Europe/Stockholm"))
+killzoneGate     = useKillzone ? inKillzone : true
+killzoneUnmapped = sessionMode == "Per-Asset Killzone" and perAssetSession == "0000-2359"
+
+// setupCandidate no longer includes a PD-array gate (removed per client)
+setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activeFvgMitigated
+
+// ============================================================================
+// 5. ENTRY TRIGGER & INVALIDATION
+// ============================================================================
+var string G_ENTRY = "5. Entry Trigger"
+entryTriggerMode = input.string("CISD Confirmation", "Entry Trigger", options=["Direct Limit Touch", "CISD Confirmation"], group=G_ENTRY, tooltip="Direct Limit Touch = enter as soon as price touches the fib entry level. CISD Confirmation = wait for a body-close reversal back through the last opposite-colour candle's open, while price is inside the zone.")
+
+entryPrice   = biasDir == 1 ? fibZoneTop : biasDir == -1 ? fibZoneBot : na
+deepBoundary = biasDir == 1 ? fibZoneBot : biasDir == -1 ? fibZoneTop : na
+
+// reset all per-swing entry state whenever the underlying Structure Stop
+// swing or bias direction changes
+swingChanged = swTime != swTime[1] or biasDir != biasDir[1]
+
+var bool  zoneTouched     = false
+var bool  setupInvalid    = false
+var float cisdRefOpen     = na
+var bool  tradeTakenSwing = false
+
+// Option B's own entry-flow state (Section 5b below) — declared here so the
+// single swingChanged reset block below can cover both flows together.
+var int   optB_phase        = 0     // 0 idle, 1 armed (+CISD confirmed), 2 redrawn (ready to enter)
+var float optB_cisdOpen     = na    // reference open for the +CISD confirm
+var float optB_failOpen     = na    // reference open for the -CISD fail/break
+var float optB_swingExtreme = na    // running extreme tracked while armed (phase 1)
+var float optB_localHigh    = na    // redrawn local fib anchor (recent high for long / low for short... see 5b)
+var float optB_localLow     = na    // redrawn local fib anchor (new low for long / high for short... see 5b)
+
+if swingChanged
+    // Real bug found via QA 2026-09-30: if an order was ALREADY submitted
+    // (tradeTakenSwing true) and is still pending/unfilled when the swing
+    // changes again, resetting state here let a brand-new signal cycle start
+    // and later call strategy.entry() with the SAME id ("Long"/"Short") —
+    // which silently OVERWRITES the still-pending order's price/qty instead
+    // of creating a new one, while the old debug label stays on the chart
+    // showing now-stale numbers that no longer match what actually filled.
+    // Cancel here — but ONLY when an order was genuinely already submitted —
+    // so a fresh setup starting later gets a clean order, not a clobbered
+    // one. This is narrower than an earlier (reverted) blanket cancel-on-
+    // swingChanged attempt, which cancelled orders that had NOT yet been
+    // submitted and killed genuinely-still-forming setups.
+    if tradeTakenSwing
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+    zoneTouched     := false
+    setupInvalid    := false
+    cisdRefOpen      := na
+    tradeTakenSwing := false
+    optB_phase        := 0
+    optB_cisdOpen     := na
+    optB_failOpen     := na
+    optB_swingExtreme := na
+    optB_localHigh    := na
+    optB_localLow     := na
+
+inZone = not na(entryPrice) and not na(deepBoundary) and setupCandidate and (biasDir == 1 ? (low <= entryPrice and close >= deepBoundary) : biasDir == -1 ? (high >= entryPrice and close <= deepBoundary) : false)
+
+if inZone and not setupInvalid
+    zoneTouched := true
+
+// Body Close Invalidation Rule: full body close beyond the deep boundary
+// before trigger fires — this IS the spec's real invalidation event, so it's
+// the correct place to cancel a still-pending Direct Limit Touch order too
+// (as opposed to swingChanged above, which fires far more often and isn't a
+// true invalidation).
+if zoneTouched and not tradeTakenSwing and not na(deepBoundary)
+    if biasDir == 1 and close < deepBoundary
+        setupInvalid := true
+        strategy.cancel("Long")
+    else if biasDir == -1 and close > deepBoundary
+        setupInvalid := true
+        strategy.cancel("Short")
+
+// CISD reference: most recent opposite-colour candle's open while price is inside the zone
+if zoneTouched and inZone and not setupInvalid
+    if biasDir == 1 and close < open
+        cisdRefOpen := open
+    else if biasDir == -1 and close > open
+        cisdRefOpen := open
+
+cisdTriggered = not na(cisdRefOpen) and (biasDir == 1 ? close > cisdRefOpen : biasDir == -1 ? close < cisdRefOpen : false)
+
+entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
+
+// ============================================================================
+// 5b. STOP LOSS OPTION B — FULL ENTRY FLOW (per client's Optimal Trade
+//    Entry.docx, confirmed in scope 2026-09-24, no price change — see
+//    status.md "Scope check"). Only takes effect when Stop Loss Model =
+//    Option B (chosen in Section 6 below) — Option A/C keep using Section
+//    5's generic zone touch/CISD entry above. Now uses the SAME validated
+//    4H FVG (activeFvgTop/Bot, mitigation-checked) that anchors the swing.
+//
+//    Flow: 1) price touches the 4H FVG in the bias direction
+//          2) +CISD confirms (first same-direction reversal candle)
+//          3) -CISD breaks (that confirm FAILS — price reverses again)
+//          4) redraw a local fib from the new extreme formed during that
+//             failed excursion to the recent high/low reached while armed
+//          5) enter at the 0.382 level of that redrawn local fib
+// ============================================================================
+touched4hFvg = setupCandidate and not na(activeFvgTop) and not na(activeFvgBot) and (biasDir == 1 ? low <= activeFvgTop : biasDir == -1 ? high >= activeFvgBot : false)
+
+if setupCandidate and (biasDir == 1 or biasDir == -1)
+    // Phase 0 -> 1: price touches the 4H FVG, then a same-direction reversal
+    // candle confirms (+CISD) — same idea as Section 5's CISD, scoped here to
+    // the FVG touch specifically.
+    if optB_phase == 0 and touched4hFvg
+        if biasDir == 1 and close < open
+            optB_cisdOpen := open
+        else if biasDir == -1 and close > open
+            optB_cisdOpen := open
+        if not na(optB_cisdOpen) and (biasDir == 1 ? close > optB_cisdOpen : close < optB_cisdOpen)
+            optB_phase        := 1
+            optB_localHigh    := biasDir == 1 ? high : na
+            optB_localLow     := biasDir == -1 ? low : na
+            optB_swingExtreme := biasDir == 1 ? low : high
+
+    // Phase 1 (armed): track the running extreme, and the recent high/low
+    // reached while armed (the OTHER anchor of the eventual redrawn fib),
+    // watching for the -CISD break (the +CISD confirm failing).
+    if optB_phase == 1
+        optB_swingExtreme := biasDir == 1 ? math.min(optB_swingExtreme, low) : math.max(optB_swingExtreme, high)
+        if biasDir == 1
+            optB_localHigh := math.max(optB_localHigh, high)
+        else
+            optB_localLow := math.min(optB_localLow, low)
+        if biasDir == 1 and close > open
+            optB_failOpen := open
+        else if biasDir == -1 and close < open
+            optB_failOpen := open
+        if not na(optB_failOpen) and (biasDir == 1 ? close < optB_failOpen : close > optB_failOpen)
+            // -CISD break confirmed: redraw the local fib off the new
+            // extreme reached during this failed excursion (already the
+            // running min/max tracked above, current bar included).
+            if biasDir == 1
+                optB_localLow := optB_swingExtreme
+            else
+                optB_localHigh := optB_swingExtreme
+            optB_phase := 2
+
+optB_localRange = not na(optB_localHigh) and not na(optB_localLow) ? optB_localHigh - optB_localLow : na
+optB_entryPrice = optB_phase == 2 and not na(optB_localRange) ? (biasDir == 1 ? optB_localHigh - 0.382 * optB_localRange : optB_localLow + 0.382 * optB_localRange) : na
+
+// ============================================================================
+// 6. STOP LOSS MODELS (Option A / B / C)
+// ============================================================================
+var string G_SL = "6. Stop Loss Model"
+slModel = input.string("Option A: Fixed 4H Fib", "Stop Loss Model", options=["Option A: Fixed 4H Fib", "Option B: Local 15m Swing Extension", "Option C: 4H FVG Boundary + Buffer"], group=G_SL)
+
+// ---- Option A: fixed fib level off the Structure Stop swing ----
+slOptionA_level = input.float(1.00, "Option A: SL Fib Level", options=[0.79, 0.85, 1.00], group=G_SL)
+slA_price = biasDir == 1 ? swHigh - slOptionA_level * (swHigh - swLow) : biasDir == -1 ? swLow + slOptionA_level * (swHigh - swLow) : na
+
+// ---- Option B: local 15m swing extension ----
+// Uses the redrawn local fib from Section 5b's full entry-flow state machine
+// (FVG touch -> +CISD -> -CISD fail -> redraw), per client's Optimal Trade
+// Entry.docx — NOT a generic lookback window.
+slOptionB_mult = input.float(1.30, "Option B: Local SL Extension Multiplier", options=[1.10, 1.20, 1.30, 1.40, 1.50], group=G_SL)
+slB_price  = optB_phase == 2 and not na(optB_localRange) ? (biasDir == 1 ? optB_localLow - (slOptionB_mult - 1.0) * optB_localRange : optB_localHigh + (slOptionB_mult - 1.0) * optB_localRange) : na
+
+// ---- Option C: 4H FVG boundary + pips/points/$ buffer ----
+// Per-asset buffer unit conversion (client-confirmed 2026-09-28): pips for
+// forex, points for indices, dollars for XAUUSD.
+f_buffer_price_units(_val) =>
+    t = syminfo.ticker
+    isJpy   = str.contains(t, "JPY")
+    isForex = t == "EURUSD" or t == "GBPUSD" or t == "AUDUSD" or t == "NZDUSD" or t == "EURJPY" or t == "GBPJPY"
+    float unit = isForex ? (isJpy ? 0.01 : 0.0001) : 1.0   // indices/XAUUSD: 1 point/$ = 1.0 price unit
+    _val * unit
+
+slOptionC_buffer = input.float(5.0, "Option C: FVG Buffer (pips fx / points idx / $ gold)", minval=2.0, maxval=10.0, group=G_SL)
+bufferPrice = f_buffer_price_units(slOptionC_buffer)
+
+// fallback to Structure Stop swing low/high minus/plus buffer if no active
+// (valid, unmitigated) 4H FVG
+slC_price = biasDir == 1 ? ((not na(activeFvgBot) and not activeFvgMitigated) ? activeFvgBot : swLow) - bufferPrice : biasDir == -1 ? ((not na(activeFvgTop) and not activeFvgMitigated) ? activeFvgTop : swHigh) + bufferPrice : na
+
+activeSL = slModel == "Option A: Fixed 4H Fib" ? slA_price : slModel == "Option B: Local 15m Swing Extension" ? slB_price : slC_price
+
+// Option B has its own bespoke entry trigger/price (Section 5b's redrawn
+// 0.382 level) — it overrides Section 5's generic zone-touch/CISD entry
+// entirely when selected, and is always treated as a limit order (the
+// confirm/fail/redraw sequence already IS the confirmation; no separate
+// CISD-vs-limit choice on top of it).
+usingOptionB      = slModel == "Option B: Local 15m Swing Extension"
+activeEntryPrice  = usingOptionB ? optB_entryPrice : entryPrice
+activeEntrySignal = usingOptionB ? (optB_phase == 2 and setupCandidate and not tradeTakenSwing) : entrySignal
+activeIsLimitEntry = usingOptionB or entryTriggerMode == "Direct Limit Touch"
+
+// Actual fill price used for risk math — NOT always the same as
+// activeEntryPrice. A limit order (Direct Limit Touch, or Option B's redrawn
+// 0.382 level) fills exactly there. CISD Confirmation (non-Option-B) fires on
+// a body-close event, and with process_orders_on_close=true a market order
+// submitted that bar fills at that bar's close — so risk sizing must anchor
+// to `close`, not the (possibly several-bars-stale) fib touch price, or
+// 0.50% risk drifts.
+fillPrice  = activeIsLimitEntry ? activeEntryPrice : close
+slDistance = not na(fillPrice) and not na(activeSL) ? math.abs(fillPrice - activeSL) : na
+
+// ============================================================================
+// 7. DYNAMIC POSITION SIZING — 0.50% risk, binary set & forget
+// ============================================================================
+var string G_RISK = "7. Risk & Position Sizing"
+riskPct = input.float(0.50, "Risk % per Trade", minval=0.01, step=0.01, group=G_RISK)
+
+riskAmount = strategy.equity * riskPct / 100
+tradeQty   = not na(slDistance) and slDistance > 0 ? riskAmount / slDistance : na
+
+// ============================================================================
+// 8. FINAL TAKE PROFIT SELECTOR
+// ============================================================================
+var string G_TP = "8. Take Profit"
+tpMode   = input.string("0% (Swing High)", "Take Profit Target", options=["0% (Swing High)", "-0.27% (Fib Extension)", "5% of Fib Range", "10% of Fib Range", "1R", "Custom"], group=G_TP)
+tpCustom = input.float(0.5, "Custom Fib Target (level beyond swing)", minval=0.0, group=G_TP, tooltip="Only used when Take Profit Target = Custom")
+
+fibRange = swHigh - swLow
+tpPrice = biasDir == 1 ?
+     (tpMode == "0% (Swing High)"           ? swHigh :
+      tpMode == "-0.27% (Fib Extension)"    ? swHigh + 0.27 * fibRange :
+      tpMode == "5% of Fib Range"            ? swHigh + 0.05 * fibRange :
+      tpMode == "10% of Fib Range"           ? swHigh + 0.10 * fibRange :
+      tpMode == "1R"                          ? (not na(fillPrice) and not na(slDistance) ? fillPrice + slDistance : na) :
+      tpMode == "Custom"                      ? swHigh - tpCustom * fibRange : na)
+   : biasDir == -1 ?
+     (tpMode == "0% (Swing High)"           ? swLow :
+      tpMode == "-0.27% (Fib Extension)"    ? swLow - 0.27 * fibRange :
+      tpMode == "5% of Fib Range"            ? swLow - 0.05 * fibRange :
+      tpMode == "10% of Fib Range"           ? swLow - 0.10 * fibRange :
+      tpMode == "1R"                          ? (not na(fillPrice) and not na(slDistance) ? fillPrice - slDistance : na) :
+      tpMode == "Custom"                      ? swLow + tpCustom * fibRange : na)
+   : na
+
+// ============================================================================
+// 9. DYNAMIC BREAK-EVEN STATE MACHINE
+// ============================================================================
+// CHoCH = 1st same-direction LTF (this chart's own TF) minor-pivot break
+// after entry, 1st BOS = 2nd break, 2nd BOS = 3rd break. CRITICAL reset rule
+// (spec Section 6): a new lower low (long) / higher high (short) forming
+// against the trade before BE fires zeroes the break counter, re-baselining
+// off the latest structure.
+var string G_BE = "9. Break-Even"
+beMode          = input.string("Option A: After LTF CHoCH", "Break-Even Trigger", options=["Option A: After LTF CHoCH", "Option B: After 1st BOS", "Option C: After 2nd BOS"], group=G_BE)
+beLtfPivotLen   = input.int(6, "BE CHoCH Sensitivity (LTF Pivot Bars)", minval=3, maxval=10, group=G_BE, tooltip="Pivot length on THIS chart's own timeframe (intended 15m) used to detect a genuine CHoCH for BE purposes. Per client 2026-09-30: keep dynamic 3-10, default 6. If running a TP R:R higher than 4, consider 8.")
+
+ph_ltf = ta.pivothigh(high, beLtfPivotLen, beLtfPivotLen)
+pl_ltf = ta.pivotlow(low, beLtfPivotLen, beLtfPivotLen)
+
+var float lastMinorHigh    = na
+var float lastMinorLow     = na
+var int   structBreakCount = 0
+var bool  beApplied        = false
+
+if strategy.position_size != 0
+    if not na(ph_ltf)
+        lastMinorHigh := ph_ltf
+    if not na(pl_ltf)
+        lastMinorLow := pl_ltf
+
+    if strategy.position_size > 0
+        if not na(lastMinorHigh) and close > lastMinorHigh
+            structBreakCount += 1
+            lastMinorHigh := na
+        // reset: new lower low against the trade before BE/BOS criteria hit
+        if not na(lastMinorLow) and low < lastMinorLow and structBreakCount > 0 and not beApplied
+            structBreakCount := 0
+    else
+        if not na(lastMinorLow) and close < lastMinorLow
+            structBreakCount += 1
+            lastMinorLow := na
+        // reset: new higher high against the trade before BE/BOS criteria hit
+        if not na(lastMinorHigh) and high > lastMinorHigh and structBreakCount > 0 and not beApplied
+            structBreakCount := 0
+
+    beTargetCount = beMode == "Option A: After LTF CHoCH" ? 1 : beMode == "Option B: After 1st BOS" ? 2 : 3
+    if not beApplied and structBreakCount >= beTargetCount
+        // re-issue the SAME exit id as Section 10's original SL/TP order, so
+        // this updates the existing stop to breakeven instead of stacking a
+        // second exit order on the same entry
+        if strategy.position_size > 0
+            strategy.exit("Exit Long", from_entry="Long", stop=strategy.position_avg_price, limit=tpPrice)
+        else
+            strategy.exit("Exit Short", from_entry="Short", stop=strategy.position_avg_price, limit=tpPrice)
+        beApplied := true
+else
+    structBreakCount := 0
+    beApplied := false
+    lastMinorHigh := na
+    lastMinorLow := na
+
+// ============================================================================
+// 10. STRATEGY EXECUTION
+// ============================================================================
+longCondition  = activeEntrySignal and biasDir == 1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
+shortCondition = activeEntrySignal and biasDir == -1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
+
+// A limit order (Direct Limit Touch, or Option B's redrawn 0.382 level)
+// fills at the intended price rather than at the signal bar's close. CISD
+// Confirmation (non-Option-B) stays a market order, since the trigger IS a
+// close-based confirmation event — fillPrice above already anchors its risk
+// math to that close, not the stale fib touch price.
+if longCondition
+    if activeIsLimitEntry
+        strategy.entry("Long", strategy.long, qty=tradeQty, limit=activeEntryPrice)
+    else
+        strategy.entry("Long", strategy.long, qty=tradeQty)
+    strategy.exit("Exit Long", from_entry="Long", stop=activeSL, limit=tpPrice)
+    tradeTakenSwing := true
+
+if shortCondition
+    if activeIsLimitEntry
+        strategy.entry("Short", strategy.short, qty=tradeQty, limit=activeEntryPrice)
+    else
+        strategy.entry("Short", strategy.short, qty=tradeQty)
+    strategy.exit("Exit Short", from_entry="Short", stop=activeSL, limit=tpPrice)
+    tradeTakenSwing := true
+
+// ============================================================================
+// 11. VISUAL / QA — sanity-check only. Full persisted 6-line-per-trade
+//     visualization across the whole history (line.new/box.new array
+//     tracking scheme) is an M3 deliverable, not built here.
+// ============================================================================
+mainAtr = ta.atr(14)
+
+bgcolor(biasDir == 1 ? color.new(color.green, 92) : biasDir == -1 ? color.new(color.red, 92) : color.new(color.gray, 95), title="Bias Direction")
+
+var box fibBox = na
+if not na(fibZoneTop) and not na(fibZoneBot)
+    box.delete(fibBox)
+    fibBox := box.new(bar_index[1], fibZoneTop, bar_index + 20, fibZoneBot, border_color=color.blue, bgcolor=color.new(color.blue, 85), xloc=xloc.bar_index)
+
+var box fvgDebugBox = na
+if showDebug and not na(activeFvgTop) and not na(activeFvgBot) and not activeFvgMitigated
+    box.delete(fvgDebugBox)
+    fvgDebugBox := box.new(bar_index[1], activeFvgTop, bar_index + 5, activeFvgBot, border_color=color.fuchsia, bgcolor=color.new(color.fuchsia, 90), xloc=xloc.bar_index)
+
+plotchar(setupCandidate, "Setup Candidate (checks passed)", "▲", location.belowbar, color=color.lime, size=size.tiny)
+plotchar(eqlDetected, "EQL Detected", "×", location.abovebar, color=color.red, size=size.tiny)
+plotchar(activeEntrySignal, "Entry Trigger Fired", "●", location.belowbar, color=color.yellow, size=size.tiny)
+plotchar(optB_phase == 1, "Option B Armed (+CISD confirmed, watching for -CISD break)", "○", location.belowbar, color=color.orange, size=size.tiny)
+
+// Per-entry debug label (QA only): prints SL/TP/qty AT the moment of entry,
+// on every historical trade — not just the most recent bar like the summary
+// label below — so a specific past trade can be checked individually.
+if showDebug and (longCondition or shortCondition)
+    dbgEntryTxt = (longCondition ? "LONG " : "SHORT ") + (usingOptionB ? "optB_redraw=" : "fibLevel=") + str.tostring(activeEntryPrice, format.mintick) + " fill=" + str.tostring(fillPrice, format.mintick) + " SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " equity=" + str.tostring(strategy.equity, "#.##") + " risk$=" + str.tostring(riskAmount, "#.##")
+    label.new(bar_index, longCondition ? low - mainAtr : high + mainAtr, dbgEntryTxt, style=longCondition ? label.style_label_up : label.style_label_down, color=color.blue, textcolor=color.white, size=size.small)
+
+var label biasLbl = na
+var label debugLbl = na
+if barstate.islast
+    label.delete(biasLbl)
+    lvlTxt = biasLevel == 0 ? "WALKAWAY" : "Level " + str.tostring(biasLevel)
+    dirTxt = biasDir == 1 ? "LONG" : biasDir == -1 ? "SHORT" : "-"
+    statusTxt = setupCandidate ? " [CANDIDATE]" : " [BLOCKED]"
+    biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
+
+    if showDebug
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
+        label.delete(debugLbl)
+        debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
+
+    if killzoneUnmapped
+        label.new(bar_index, low - mainAtr, "⚠ Ticker '" + syminfo.ticker + "' not in killzone map — add it to f_killzone_session()", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
