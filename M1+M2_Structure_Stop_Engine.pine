@@ -572,7 +572,9 @@ tpPrice = biasDir == 1 ?
 // against the trade before BE fires zeroes the break counter, re-baselining
 // off the latest structure.
 var string G_BE = "9. Break-Even"
-beMode          = input.string("Option A: After LTF CHoCH", "Break-Even Trigger", options=["Option A: After LTF CHoCH", "Option B: After 1st BOS", "Option C: After 2nd BOS"], group=G_BE)
+// "Off" added per client Side Milestone request 2026-10-05, for baseline
+// testing with no BE management at all.
+beMode          = input.string("Option A: After LTF CHoCH", "Break-Even Trigger", options=["Off", "Option A: After LTF CHoCH", "Option B: After 1st BOS", "Option C: After 2nd BOS"], group=G_BE, tooltip="Off = no break-even management (baseline/control test).")
 beLtfPivotLen   = input.int(6, "BE CHoCH Sensitivity (LTF Pivot Bars)", minval=3, maxval=10, group=G_BE, tooltip="Pivot length on THIS chart's own timeframe (intended 15m) used to detect a genuine CHoCH for BE purposes. Per client 2026-09-30: keep dynamic 3-10, default 6. If running a TP R:R higher than 4, consider 8.")
 
 ph_ltf = ta.pivothigh(high, beLtfPivotLen, beLtfPivotLen)
@@ -582,11 +584,22 @@ var float lastMinorHigh    = na
 var float lastMinorLow     = na
 var int   structBreakCount = 0
 var bool  beApplied        = false
+// Per client Side Milestone request 2026-10-05 ("Immediate Break-Even
+// Reset"): marks the bar a position opened on, so pivots whose own bar
+// predates entry (stale, left-swing structure) can never populate
+// lastMinorHigh/Low and instantly trigger a break count — only genuinely
+// post-entry minor structure counts.
+var int   entryBarIndex    = na
 
 if strategy.position_size != 0
-    if not na(ph_ltf)
+    if na(entryBarIndex)
+        entryBarIndex := bar_index
+    // ta.pivothigh/low confirms with a _len-bar lag, so the pivot's OWN bar
+    // is (bar_index - beLtfPivotLen) — only accept it if that bar is at or
+    // after entry, not a pivot describing pre-entry (left-swing) structure.
+    if not na(ph_ltf) and (bar_index - beLtfPivotLen) >= entryBarIndex
         lastMinorHigh := ph_ltf
-    if not na(pl_ltf)
+    if not na(pl_ltf) and (bar_index - beLtfPivotLen) >= entryBarIndex
         lastMinorLow := pl_ltf
 
     if strategy.position_size > 0
@@ -605,7 +618,7 @@ if strategy.position_size != 0
             structBreakCount := 0
 
     beTargetCount = beMode == "Option A: After LTF CHoCH" ? 1 : beMode == "Option B: After 1st BOS" ? 2 : 3
-    if not beApplied and structBreakCount >= beTargetCount
+    if beMode != "Off" and not beApplied and structBreakCount >= beTargetCount
         // re-issue the SAME exit id as Section 10's original SL/TP order, so
         // this updates the existing stop to breakeven instead of stacking a
         // second exit order on the same entry
@@ -619,6 +632,7 @@ else
     beApplied := false
     lastMinorHigh := na
     lastMinorLow := na
+    entryBarIndex := na
 
 // ============================================================================
 // 10. STRATEGY EXECUTION
