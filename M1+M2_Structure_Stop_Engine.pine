@@ -444,7 +444,16 @@ touched4hFvg = setupCandidate and not na(activeFvgTop) and not na(activeFvgBot) 
 //   2. zoneTouched (Section 5, reused as-is): Option B may only begin
 //      arming after price has actually retraced into the macro 4H Fib
 //      Entry Level zone for this swing — not just whenever the FVG forms.
-fvgDepthOk = biasDir == 1 and not na(activeFvgTop) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (swHigh - activeFvgTop) / (swHigh - swLow) >= fibEntryLevel : biasDir == -1 and not na(activeFvgBot) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (activeFvgBot - swLow) / (swHigh - swLow) >= fibEntryLevel : false
+// Bug found via QA 2026-10-06: Structure Stop's swHigh is the price level
+// that got BROKEN to create the FVG, so the FVG commonly sits AT or ABOVE
+// swHigh (long case) / AT or BELOW swLow (short case) — not between them as
+// originally assumed. That made (swHigh - activeFvgTop) negative, which is
+// always < any Fib level, so fvgDepthOk was false on every real case
+// regardless of the Fib Entry Level setting (confirmed zero trades even at
+// the loosest 0.5 setting). Fixed: an FVG sitting at/beyond the break point
+// is structurally at least as significant as one inside the retracement
+// band, so that case now auto-passes instead of auto-failing.
+fvgDepthOk = biasDir == 1 and not na(activeFvgTop) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (activeFvgTop > swHigh ? true : (swHigh - activeFvgTop) / (swHigh - swLow) >= fibEntryLevel) : biasDir == -1 and not na(activeFvgBot) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (activeFvgBot < swLow ? true : (activeFvgBot - swLow) / (swHigh - swLow) >= fibEntryLevel) : false
 
 if setupCandidate and (biasDir == 1 or biasDir == -1)
     // Phase 0 -> 1: price touches the 4H FVG, then a same-direction reversal
@@ -551,8 +560,24 @@ slDistance = not na(fillPrice) and not na(activeSL) ? math.abs(fillPrice - activ
 var string G_RISK = "7. Risk & Position Sizing"
 riskPct = input.float(0.50, "Risk % per Trade", minval=0.01, step=0.01, group=G_RISK)
 
+// Per client Side Milestone request 2026-10-05/06 (Forex/Gold Risk Engine
+// Fix): normalize with syminfo.pointvalue. Investigated — on futures,
+// pointvalue is the $ cost of a 1-point move per contract (e.g. ES futures
+// = $50/point); on forex/CFD/metal symbols (everything client actually
+// trades) it's normally 1, since price itself already IS the point value.
+// This is why the formula has matched TradingView's own reported PnL
+// exactly on every verified test (NZDUSD, XAUUSD, US500) without it —
+// pointvalue was already effectively 1 there. Adding it here is a SAFE,
+// defensive no-op for those symbols (dividing by 1 changes nothing) while
+// making the formula correctly handle true futures contracts too, if ever
+// used on one.
+// pointValue defaults to 1 via nz() if the feed doesn't provide one (spot
+// forex doesn't always have a well-defined pointvalue the way futures do) —
+// found via QA 2026-10-06: without this default, `na > 0` evaluates false
+// in Pine, silently making tradeQty na on every bar and killing all trades.
+pointValue = nz(syminfo.pointvalue, 1)
 riskAmount = strategy.equity * riskPct / 100
-tradeQty   = not na(slDistance) and slDistance > 0 ? riskAmount / slDistance : na
+tradeQty   = not na(slDistance) and slDistance > 0 and pointValue > 0 ? riskAmount / (slDistance * pointValue) : na
 
 // ============================================================================
 // 8. FINAL TAKE PROFIT SELECTOR
@@ -704,7 +729,7 @@ plotchar(optB_phase == 1, "Option B Armed (+CISD confirmed, watching for -CISD b
 // on every historical trade — not just the most recent bar like the summary
 // label below — so a specific past trade can be checked individually.
 if showDebug and (longCondition or shortCondition)
-    dbgEntryTxt = (longCondition ? "LONG " : "SHORT ") + (usingOptionB ? "optB_redraw=" : "fibLevel=") + str.tostring(activeEntryPrice, format.mintick) + " fill=" + str.tostring(fillPrice, format.mintick) + " SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " equity=" + str.tostring(strategy.equity, "#.##") + " risk$=" + str.tostring(riskAmount, "#.##")
+    dbgEntryTxt = (longCondition ? "LONG " : "SHORT ") + (usingOptionB ? "optB_redraw=" : "fibLevel=") + str.tostring(activeEntryPrice, format.mintick) + " fill=" + str.tostring(fillPrice, format.mintick) + " SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " equity=" + str.tostring(strategy.equity, "#.##") + " risk$=" + str.tostring(riskAmount, "#.##") + " pointvalue=" + str.tostring(pointValue, "#.####")
     label.new(bar_index, longCondition ? low - mainAtr : high + mainAtr, dbgEntryTxt, style=longCondition ? label.style_label_up : label.style_label_down, color=color.blue, textcolor=color.white, size=size.small)
 
 var label biasLbl = na
