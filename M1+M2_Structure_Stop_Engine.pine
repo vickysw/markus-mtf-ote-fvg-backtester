@@ -433,11 +433,26 @@ entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and (entr
 // ============================================================================
 touched4hFvg = setupCandidate and not na(activeFvgTop) and not na(activeFvgBot) and (biasDir == 1 ? low <= activeFvgTop : biasDir == -1 ? high >= activeFvgBot : false)
 
+// FIB-GATE for Option B — per client Side Milestone request 2026-10-05/06:
+// Fib Entry Level must be a strict gate for ALL entry models, including
+// Option B, which previously ignored it entirely. Two parts:
+//   1. fvgDepthOk: the active 4H FVG itself must sit at or beyond (deeper
+//      than) the selected Fib Entry Level, not shallower — client's own
+//      example: Fib=0.62 but FVG only at 0.5 (shallower) => no trade.
+//      Computed by expressing the FVG's own position on the same 0-1 fib
+//      scale as swHigh/swLow, then comparing to fibEntryLevel.
+//   2. zoneTouched (Section 5, reused as-is): Option B may only begin
+//      arming after price has actually retraced into the macro 4H Fib
+//      Entry Level zone for this swing — not just whenever the FVG forms.
+fvgDepthOk = biasDir == 1 and not na(activeFvgTop) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (swHigh - activeFvgTop) / (swHigh - swLow) >= fibEntryLevel : biasDir == -1 and not na(activeFvgBot) and not na(swHigh) and not na(swLow) and (swHigh - swLow) > 0 ? (activeFvgBot - swLow) / (swHigh - swLow) >= fibEntryLevel : false
+
 if setupCandidate and (biasDir == 1 or biasDir == -1)
     // Phase 0 -> 1: price touches the 4H FVG, then a same-direction reversal
     // candle confirms (+CISD) — same idea as Section 5's CISD, scoped here to
-    // the FVG touch specifically.
-    if optB_phase == 0 and touched4hFvg
+    // the FVG touch specifically. Now gated by zoneTouched + fvgDepthOk (see
+    // above) so Option B can't arm on a shallow FVG or before the macro fib
+    // zone has actually been reached.
+    if optB_phase == 0 and touched4hFvg and zoneTouched and fvgDepthOk
         if biasDir == 1 and close < open
             optB_cisdOpen := open
         else if biasDir == -1 and close > open
@@ -702,7 +717,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
