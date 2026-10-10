@@ -102,17 +102,24 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
             array.shift(minorPivs)
             array.shift(minorPivBars)
 
-    var float swAnchor     = na   // the broken minor pivot — Fib 0% side
-    var float swExtreme    = na   // lowest/highest wick in the block — Fib 100% side
-    var int   swTime       = na
-    var float fvgTop       = na
-    var float fvgBot       = na
-    var bool  fvgMitigated = false
+    var float swAnchor      = na   // the broken minor pivot — Fib 0% side
+    var float swExtreme     = na   // lowest/highest wick in the block — Fib 100% side
+    var int   swTime        = na
+    var float fvgTop        = na
+    var float fvgBot        = na
+    var bool  fvgMitigated  = false
+    // Per client Side Milestone request 2026-10-05/06 (Candle 3 Mitigation
+    // Fix): tracks which bar the active FVG formed on, so barsSinceFvg can
+    // PROVE mitigation never fires on the formation bar itself (the
+    // if/fvgNow vs else-if/touch-check split already makes this
+    // architecturally impossible — this just makes it visible).
+    var int   fvgFormationBar = na
 
     if fvgNow
         fvgTop := _dir == 1 ? low : low[2]
         fvgBot := _dir == 1 ? high[2] : high
         fvgMitigated := false
+        fvgFormationBar := bar_index
         float foundPiv = na
         int   foundBar = na
         if array.size(minorPivs) > 0
@@ -138,12 +145,13 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
             swAnchor  := na
             swExtreme := na
 
+    barsSinceFvg = na(fvgFormationBar) ? na : bar_index - fvgFormationBar
     swHigh = _dir == 1 ? swAnchor : swExtreme
     swLow  = _dir == 1 ? swExtreme : swAnchor
-    [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated]
+    [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated, barsSinceFvg]
 
-[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
-[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull, barsSinceFvgBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear, barsSinceFvgBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
 
 // ============================================================================
 // 2. HTF BIAS ENGINE — ported unchanged from client's BIAS_3_Filter.pine;
@@ -235,6 +243,10 @@ swTime   = biasDir == 1 ? swTimeBull : biasDir == -1 ? swTimeBear : na
 activeFvgTop       = biasDir == 1 ? fvgTopBull       : biasDir == -1 ? fvgTopBear       : na
 activeFvgBot       = biasDir == 1 ? fvgBotBull       : biasDir == -1 ? fvgBotBear       : na
 activeFvgMitigated = biasDir == 1 ? fvgMitigatedBull : biasDir == -1 ? fvgMitigatedBear : true
+// Side Milestone item 4 (mitigation timing review) — proof, not logic:
+// always >= 1 whenever mitigated=true, confirming mitigation can never
+// fire on the FVG's own formation bar (0).
+activeBarsSinceFvg = biasDir == 1 ? barsSinceFvgBull : biasDir == -1 ? barsSinceFvgBear : na
 
 // entry-zone band (fibEntryLevel .. deep boundary), anchored off the
 // Structure Stop swing, in bias direction
@@ -742,7 +754,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
