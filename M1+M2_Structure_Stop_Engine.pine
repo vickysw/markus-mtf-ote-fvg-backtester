@@ -1,65 +1,27 @@
 // ============================================================================
 // Markus — Multi-Timeframe OTE & FVG Backtester
-// M1+M2 COMBINED — Structure Stop / 4H-FVG-Anchored Engine
-// (DRAFT — not yet compiled or client-reviewed)
+// Structure Stop / 4H-FVG-Anchored Engine
 //
-// SUPERSEDES M1_Foundation_Bias_Engine.pine + M2_Entry_SL_Risk_Engine.pine.
-// Built 2026-10-02 per 3 client messages requesting changes to the swing/fib
-// foundation (M1 Section 1/2), which M1 was already approved and paid for
-// (2026-09-29). Per status.md decision 2026-10-02: client acknowledged these
-// are M1-level changes, built as a goodwill revision rather than a new paid
-// item.
+// On a valid 4H FVG, the engine scans backward for the most recent minor
+// swing point broken by the move (the MSS/CHoCH origin) and anchors the Fib
+// 100% end at the swing extreme between that break and the FVG. A 4H FVG
+// only counts if candle 2's body is >= the displacement ratio of its range
+// and the gap is >= ATR(14) x the min gap setting; it stays valid only while
+// completely untouched since formation.
 //
-// WHAT CHANGED vs the approved M1/M2:
-//   1. "Structure Stop" swing/fib anchoring (NEW, replaces fixed-lookback
-//      pivot swing entirely): a 4H FVG is now the TRIGGER for the whole fib
-//      zone. On a valid 4H FVG, scan backward bar-by-bar for the most recent
-//      minor swing point broken by the move (the MSS/CHoCH origin), stop the
-//      scan there, and anchor Fib 100% at the lowest/highest wick between
-//      that break point and the FVG. The old "4H Swing Pivot Length" fixed
-//      lookback is gone.
-//   2. Daily PD-Array filter REMOVED entirely (f_daily_fvg, f_daily_ob,
-//      pdArrayMode, pdArrayGate) — client confirmed 2026-10-02 he does not
-//      use Daily FVG/OB at all; his system is 4H-only. bias_tradeable no
-//      longer requires a PD-array check.
-//   3. Strict 4H FVG validity rules, applied everywhere a 4H FVG is used
-//      (Structure Stop anchor, Option B's entry flow, Option C's SL):
-//      - Displacement: candle 2's body >= 70% of its high-low range
-//        (fvgDispRatio input, default 0.70).
-//      - Minimum size: gap >= ATR(14) x fvg_min_atr_pct (input, default
-//        0.20, range 0.05-1.0) — exact per client spec.
-//      - Mitigation: an FVG is only valid while completely untouched since
-//        it formed. The first bar price trades back into it, it's discarded
-//        (fvgMitigated) and the engine waits for the next qualifying FVG.
-//
-// KNOWN ASSUMPTIONS — flag to client, same pattern as every prior ambiguous
-// spec item in this project:
-//   - "Minor Swing High/Low" (for the backward MSS scan) pivot length is NOT
-//     specified by the client. Defaulted to 3 bars (minorSwingPivotLen
-//     input), exposed and tunable. Needs his review.
-//   - Backward scan is capped at structureScanCap bars (default 500, ~83
-//     days on 4H) as a safety/performance limit — not in the client's spec,
-//     added so a pathological chart can't trigger a runaway loop. In normal
-//     use this should essentially never bind.
-//   - Mitigation rule (message 3, point 3) was worded as "FVG must remain
-//     untouched until price retraces into the Fib Entry Level" — interpreted
-//     here as the standard ICT "fresh/untested FVG" concept (any touch since
-//     formation invalidates it), since the FVG is expected to sit at/near
-//     the fib entry zone it anchors. Flagged in case his intent was a
-//     stricter/different two-zone check.
-//   - swHighTime/swLowTime collapsed into a single swTime (both ends of the
-//     swing now update together, since one FVG event produces both anchors
-//     at once) — functionally equivalent for the existing swingChanged logic.
-//
-// Everything below this is otherwise IDENTICAL in scope/behavior to the
-// approved M1 (bias engine, EQL filter, killzone/session) and approved-
-// pending-payment M2 (entry trigger, all 3 SL models, position sizing, TP,
-// break-even state machine) — see M1_Foundation_Bias_Engine.pine and
-// M2_Entry_SL_Risk_Engine.pine headers/status.md for that history.
+// KNOWN ASSUMPTIONS — for your review:
+//   - Minor Swing High/Low pivot length (for the backward MSS scan) is not
+//     separately specified — defaulted to 3 bars, exposed as an input.
+//   - Backward scan capped at 500 bars (~83 days on 4H) as a safety limit on
+//     how far it can look; should essentially never bind in normal use.
+//   - Mitigation: an FVG is treated as invalid as soon as price trades back
+//     into it at all since formation (not only once price reaches the Fib
+//     Entry Level) — standard "fresh/untested FVG" read. Flag if your intent
+//     was a stricter two-zone check instead.
 // ============================================================================
 
 //@version=5
-strategy("Markus MTF OTE/FVG — Structure Stop Engine", shorttitle="Markus M1+M2", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, default_qty_type=strategy.fixed, initial_capital=10000, currency=currency.USD, commission_type=strategy.commission.percent, commission_value=0.0, process_orders_on_close=true)
+strategy("Markus MTF OTE/FVG — Structure Stop Engine", shorttitle="M1+M2 SSE", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, default_qty_type=strategy.fixed, initial_capital=10000, currency=currency.USD, commission_type=strategy.commission.percent, commission_value=0.0, process_orders_on_close=true)
 
 // ============================================================================
 // 0. DEBUG (QA only — leave off for normal use)
@@ -79,15 +41,26 @@ minorSwingPivotLen = input.int(3, "Minor Swing Pivot Length (4H bars)", minval=1
 fvgDispRatio        = input.float(0.70, "4H FVG: Min Displacement Body Ratio", minval=0.50, maxval=0.95, step=0.05, group=G_STRUCT, tooltip="Candle 2's body must be at least this fraction of its high-low range for the FVG to count as a valid expansion (client spec: 0.70)")
 fvgMinAtrPct         = input.float(0.20, "4H FVG: Min Gap Size (x ATR14)", minval=0.05, maxval=1.0, step=0.05, group=G_STRUCT, tooltip="FVG gap must be at least this fraction of 4H ATR(14) to filter noise (client spec: default 0.20, range 0.05-1.0)")
 structureScanCap     = input.int(500, "Structure Stop: Max Backward Scan (4H bars)", minval=50, group=G_STRUCT, tooltip="Safety cap on how far back the MSS/CHoCH scan can look — not in client spec, prevents a runaway loop on a pathological chart. Should rarely/never bind in normal use.")
+// Declared here (not Section 3, where it's also listed/used for the EQL
+// filter itself) because client explicitly asked to reuse this SAME toggle
+// to switch the Structure Stop backward scan between modes too (Side
+// Milestone item 2, client message 2026-10-06): ON = pure trend continuation
+// (today's plain lowest/highest wick in the block). OFF = strict liquidity
+// sweep required (the wick must be a genuine confirmed minor pivot that
+// pierced the prior one by >=1 tick) — no valid swing until one is found.
+var string G_LIQ = "3. Liquidity / EQL Filter"
+eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = strict mode: both (a) rejects a setup if equal-lows/highs liquidity sits at the swing origin (Section 3), AND (b) requires the Structure Stop 100% anchor to be a verified liquidity sweep (pierced the prior minor pivot by >=1 tick), not just the plain lowest/highest wick. ON = relaxes both — allows EQL at the swing origin, and uses plain trend-continuation anchoring without sweep verification. Per client 2026-10-06.")
+strictSweepMode = not eqlAllowToggle
 
 // Finds the most recent valid 4H FVG in direction _dir, then scans backward
 // for the minor swing point it broke (MSS/CHoCH origin), and anchors the
-// fib's 100% end at the extreme wick between that break and the FVG. Also
-// tracks FVG mitigation (any touch since formation invalidates it). Called
-// twice below (bull/bear) — each call site gets its own independent `var`
-// state, same proven pattern as f_smc_choch_trend's two calls elsewhere in
-// this file.
-f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
+// fib's 100% end at a verified liquidity-sweep wick between that break and
+// the FVG (Side Milestone item 2) — or the plain extreme wick, if
+// _strictSweep is off. Also tracks FVG mitigation (any touch since formation
+// invalidates it). Called twice below (bull/bear) — each call site gets its
+// own independent `var` state, same proven pattern as f_smc_choch_trend's
+// two calls elsewhere in this file.
+f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _strictSweep, _fibLevel) =>
     bodyRatio = math.abs(close[1] - open[1]) / (high[1] - low[1])
     atrv = ta.atr(14)
     fvgNow = _dir == 1 ? (low > high[2] and bodyRatio >= _dispRatio and (low - high[2]) >= atrv * _minAtrPct) : (high < low[2] and bodyRatio >= _dispRatio and (low[2] - high) >= atrv * _minAtrPct)
@@ -102,8 +75,22 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
             array.shift(minorPivs)
             array.shift(minorPivBars)
 
+    // Side Milestone item 2 (Liquidity Sweep Verification): OPPOSITE-type
+    // minor pivots (lows for a long's 100% anchor, highs for a short's) —
+    // separate from minorPivs above, which tracks the SAME-type pivots used
+    // to find the broken MSS/CHoCH origin (the 0% anchor).
+    var float[] minorPivsOpp    = array.new_float(0)
+    var int[]   minorPivBarsOpp = array.new_int(0)
+    pivOpp = _dir == 1 ? ta.pivotlow(low, _minorPivLen, _minorPivLen) : ta.pivothigh(high, _minorPivLen, _minorPivLen)
+    if not na(pivOpp)
+        array.push(minorPivsOpp, pivOpp)
+        array.push(minorPivBarsOpp, bar_index - _minorPivLen)
+        if array.size(minorPivsOpp) > 150
+            array.shift(minorPivsOpp)
+            array.shift(minorPivBarsOpp)
+
     var float swAnchor      = na   // the broken minor pivot — Fib 0% side
-    var float swExtreme     = na   // lowest/highest wick in the block — Fib 100% side
+    var float swExtreme     = na   // verified liquidity-sweep (or plain extreme) wick — Fib 100% side
     var int   swTime        = na
     var float fvgTop        = na
     var float fvgBot        = na
@@ -116,10 +103,13 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
     var int   fvgFormationBar = na
 
     if fvgNow
-        fvgTop := _dir == 1 ? low : low[2]
-        fvgBot := _dir == 1 ? high[2] : high
-        fvgMitigated := false
-        fvgFormationBar := bar_index
+        // Build everything in temp vars first — nothing commits to the
+        // persisted `var` state until the discount-zone filter below passes.
+        float tmpFvgTop = _dir == 1 ? low : low[2]
+        float tmpFvgBot = _dir == 1 ? high[2] : high
+        float tmpSwAnchor = na
+        float tmpSwExtreme = na
+        int   tmpSwTime = na
         float foundPiv = na
         int   foundBar = na
         if array.size(minorPivs) > 0
@@ -135,9 +125,64 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
                     break
         if not na(foundPiv)
             barsBack = bar_index - foundBar
-            swAnchor  := foundPiv
-            swExtreme := _dir == 1 ? ta.lowest(low, barsBack + 1) : ta.highest(high, barsBack + 1)
-            swTime    := time
+            tmpSwAnchor := foundPiv
+            tmpSwTime   := time
+
+            if _strictSweep
+                // "True Institutional Origin" + "Verify the Liquidity
+                // Sweep" (client 2026-10-06): find the extreme CONFIRMED
+                // opposite-type pivot within [foundBar, bar_index] (not
+                // just the raw lowest/highest wick), then verify it pierced
+                // the PRIOR pivot of the same type ("History Depth = 1") by
+                // at least 1 tick — confirming a genuine stop-hunt, not an
+                // arbitrary local extreme. If no sweep can be verified, no
+                // valid swing forms this round (tmpSwExtreme stays na).
+                float extremeVal = na
+                int   extremeIdx = na
+                if array.size(minorPivsOpp) > 0
+                    for j = array.size(minorPivsOpp) - 1 to 0
+                        bj = array.get(minorPivBarsOpp, j)
+                        if bj < foundBar
+                            break
+                        vj = array.get(minorPivsOpp, j)
+                        if na(extremeVal) or (_dir == 1 ? vj < extremeVal : vj > extremeVal)
+                            extremeVal := vj
+                            extremeIdx := j
+                if not na(extremeVal) and extremeIdx > 0
+                    priorVal = array.get(minorPivsOpp, extremeIdx - 1)
+                    swept = _dir == 1 ? extremeVal < priorVal - syminfo.mintick : extremeVal > priorVal + syminfo.mintick
+                    tmpSwExtreme := swept ? extremeVal : na
+                else
+                    tmpSwExtreme := na   // no confirmed opposite pivot in the block, or no prior pivot to compare against — can't verify a sweep
+            else
+                // Allow EQL at Swing Start = ON: pure trend-continuation
+                // mode, unchanged from before item 2 — plain extreme wick,
+                // no sweep verification required.
+                tmpSwExtreme := _dir == 1 ? ta.lowest(low, barsBack + 1) : ta.highest(high, barsBack + 1)
+
+        // Discount-zone FVG location filter (client clarification
+        // 2026-10-15): the 4H FVG itself must sit at/beyond the macro Fib
+        // Entry Level, near the swing's discount end (deep, close to the
+        // 100% anchor) — not in premium territory near the break point. If
+        // it doesn't qualify, this FVG is completely ignored: nothing
+        // commits, and any PRIOR valid swing/FVG state (if one exists) is
+        // left untouched, exactly as if fvgNow had been false this bar.
+        // Deliberately no "auto-pass if beyond the swing edge" exception
+        // here (unlike Option B's separate fvgDepthOk gate) — the client
+        // explicitly wants premium-zone FVGs rejected outright, not waved
+        // through.
+        tmpSwHigh = _dir == 1 ? tmpSwAnchor : tmpSwExtreme
+        tmpSwLow  = _dir == 1 ? tmpSwExtreme : tmpSwAnchor
+        fvgDiscountOk = not na(tmpSwHigh) and not na(tmpSwLow) and (tmpSwHigh - tmpSwLow) > 0 and (_dir == 1 ? (tmpSwHigh - tmpFvgTop) / (tmpSwHigh - tmpSwLow) >= _fibLevel : (tmpFvgBot - tmpSwLow) / (tmpSwHigh - tmpSwLow) >= _fibLevel)
+
+        if fvgDiscountOk
+            fvgTop := tmpFvgTop
+            fvgBot := tmpFvgBot
+            fvgMitigated := false
+            fvgFormationBar := bar_index
+            swAnchor  := tmpSwAnchor
+            swExtreme := tmpSwExtreme
+            swTime    := tmpSwTime
     else if not na(fvgTop) and not fvgMitigated
         touched = _dir == 1 ? (low <= fvgTop) : (high >= fvgBot)
         if touched
@@ -150,8 +195,8 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap) =>
     swLow  = _dir == 1 ? swExtreme : swAnchor
     [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated, barsSinceFvg]
 
-[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull, barsSinceFvgBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
-[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear, barsSinceFvgBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull, barsSinceFvgBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear, barsSinceFvgBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel), barmerge.gaps_off, barmerge.lookahead_off)
 
 // ============================================================================
 // 2. HTF BIAS ENGINE — ported unchanged from client's BIAS_3_Filter.pine;
@@ -262,8 +307,10 @@ else if biasDir == -1 and not na(swHigh) and not na(swLow)
 // ============================================================================
 // 3. LIQUIDITY / EQL DETECTION FILTER   (unchanged)
 // ============================================================================
-var string G_LIQ = "3. Liquidity / EQL Filter"
-eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = reject setup if equal-lows/highs (double bottom/top) liquidity sits at the swing origin. ON = allow trade anyway, for winrate A/B comparison.")
+// G_LIQ and eqlAllowToggle declared earlier (Section 1b) since the toggle is
+// now also used to gate the Structure Stop liquidity-sweep validation (Side
+// Milestone item 2) — still shows in this "3. Liquidity / EQL Filter" group
+// in the settings panel, just physically declared earlier in the source.
 eqlPivotLen    = input.int(7, "EQL Pivot Length (4H bars)", minval=2, group=G_LIQ, tooltip="Independent of the Structure Stop minor-pivot length — controls only how sensitive EQL's own minor-pivot detection is, does not affect the macro fib-zone swing")
 eqlAtrSens     = input.float(0.10, "EQL ATR Sensitivity", minval=0.01, step=0.01, group=G_LIQ, tooltip="Max distance, in ATR, between two PIVOT lows/highs to count as 'equal' liquidity (double bottom/top)")
 eqlPivotDepth  = input.int(5, "EQL Pivot History Depth", minval=1, maxval=20, group=G_LIQ, tooltip="How many prior EQL pivots to compare each new pivot against")
@@ -587,7 +634,14 @@ riskPct = input.float(0.50, "Risk % per Trade", minval=0.01, step=0.01, group=G_
 // forex doesn't always have a well-defined pointvalue the way futures do) —
 // found via QA 2026-10-06: without this default, `na > 0` evaluates false
 // in Pine, silently making tradeQty na on every bar and killing all trades.
-pointValue = nz(syminfo.pointvalue, 1)
+// Bug found via QA 2026-10-12: nz() only catches na, not a literal 0 — some
+// CFD feeds (e.g. ICMARKETS US500, OANDA XAUUSD) report pointvalue as 0
+// rather than na for non-futures instruments, which nz() lets straight
+// through, making `pointValue > 0` false and tradeQty na on EVERY bar —
+// zero trades ever, with setupCandidate/▲ markers unaffected (they don't
+// check tradeQty). Fixed: treat 0 (and any <=0) the same as na.
+rawPointValue = syminfo.pointvalue
+pointValue    = (na(rawPointValue) or rawPointValue <= 0) ? 1 : rawPointValue
 riskAmount = strategy.equity * riskPct / 100
 tradeQty   = not na(slDistance) and slDistance > 0 and pointValue > 0 ? riskAmount / (slDistance * pointValue) : na
 
@@ -754,7 +808,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####")
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
