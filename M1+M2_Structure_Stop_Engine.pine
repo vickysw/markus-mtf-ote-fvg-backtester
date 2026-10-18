@@ -443,6 +443,9 @@ setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activ
 // ============================================================================
 var string G_ENTRY = "5. Entry Trigger"
 entryTriggerMode = input.string("CISD Confirmation", "Entry Trigger", options=["Direct Limit Touch", "CISD Confirmation"], group=G_ENTRY, tooltip="Direct Limit Touch = enter as soon as price touches the fib entry level. CISD Confirmation = wait for a body-close reversal back through the last opposite-colour candle's open, while price is inside the zone.")
+// Applies to this Section 5 CISD entry flow (Options A & C, which share it)
+// — Option B has its own separate entry flow (Section 5b), not covered.
+volumeAnomalyFilter = input.bool(false, "Volume Anomaly Filter (15m)", group=G_ENTRY, tooltip="ON = requires at least one 15m bar, matching the trade's direction (green for long/red for short), with volume below its 20-period EMA, somewhere between the zone touch and entry trigger — a sign of a low-volume pause before the move. OFF = no check.")
 
 entryPrice   = biasDir == 1 ? fibZoneTop : biasDir == -1 ? fibZoneBot : na
 deepBoundary = biasDir == 1 ? fibZoneBot : biasDir == -1 ? fibZoneTop : na
@@ -455,6 +458,11 @@ var bool  zoneTouched     = false
 var bool  setupInvalid    = false
 var float cisdRefOpen     = na
 var bool  tradeTakenSwing = false
+// Volume Anomaly Filter: set true the first time a direction-matching,
+// below-EMA-volume 15m bar occurs while the zone is active. Reset alongside
+// zoneTouched in the swingChanged block below.
+var bool  volumeAnomalySeen = false
+volEma = ta.ema(volume, 20)
 
 // Option B's own entry-flow state (Section 5b below) — declared here so the
 // single swingChanged reset block below can cover both flows together.
@@ -485,6 +493,7 @@ if swingChanged
     setupInvalid    := false
     cisdRefOpen      := na
     tradeTakenSwing := false
+    volumeAnomalySeen := false
     optB_phase        := 0
     optB_cisdOpen     := na
     optB_failOpen     := na
@@ -519,7 +528,16 @@ if zoneTouched and inZone and not setupInvalid
 
 cisdTriggered = not na(cisdRefOpen) and (biasDir == 1 ? close > cisdRefOpen : biasDir == -1 ? close < cisdRefOpen : false)
 
-entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
+// Volume Anomaly Filter: scan every bar the zone is active (up to and
+// including the entry trigger bar) for a direction-matching, below-EMA-
+// volume bar — a low-volume pause before the move.
+if zoneTouched and not setupInvalid and not tradeTakenSwing
+    directionalBar = biasDir == 1 ? close > open : biasDir == -1 ? close < open : false
+    if directionalBar and volume < volEma
+        volumeAnomalySeen := true
+volumeAnomalyGate = volumeAnomalyFilter ? volumeAnomalySeen : true
+
+entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and volumeAnomalyGate and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
 
 // Declared here (not Section 6, where it's grouped/shown — same pattern as
 // eqlAllowToggle in Section 1b) because Section 5b below needs it, and Pine
@@ -852,7 +870,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " volAnomaly=" + str.tostring(volumeAnomalySeen) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
