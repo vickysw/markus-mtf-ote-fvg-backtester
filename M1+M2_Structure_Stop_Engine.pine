@@ -51,6 +51,10 @@ macroAnchorSweepFilter = input.bool(false, "Macro Anchor Sweep Filter", group=G_
 // minorSwingPivotLen for consistency with the rest of Structure Stop,
 // needs his review like the other ambiguous pivot-length items above.
 trendMaturityFilter = input.string("Off (All Stages)", "Trend Maturity Filter", options=["Off (All Stages)", "CHoCH & BOS 1 (Fresh)", "BOS 2 (Mature)", ">BOS 3 (Exhausted)"], group=G_STRUCT, tooltip="Classifies each swing by how many consecutive same-direction 4H structure breaks (BOS) have occurred since the last trend reversal (CHoCH). Off = include all stages. Otherwise, only setups matching the exact selected stage are shown.")
+
+var string G_SMT = "1c. Intermarket Correlation (SMT)"
+smtFilterOn = input.bool(false, "Filter by Correlated Sync (SMT)", group=G_SMT, tooltip="ON = only allow a setup if the correlated asset shows SMT divergence at the trading asset's swing anchor: for a long, the trading asset sweeps a new low while the correlated asset fails to sweep a new high (and vice versa for shorts). OFF = no check.")
+smtCorrelatedTicker = input.symbol("DXY", "Correlated Asset Ticker", group=G_SMT, tooltip="e.g. DXY for USD pairs/XAUUSD, or another pair per the client's correlation ranking (EURUSD/GBPUSD/AUDUSD/NZDUSD chain).")
 // Declared here (not Section 3, where it's also listed/used for the EQL
 // filter itself) because this same toggle also switches the Structure Stop
 // backward scan between modes: ON = pure trend continuation (plain
@@ -61,6 +65,35 @@ var string G_LIQ = "3. Liquidity / EQL Filter"
 eqlAllowToggle = input.bool(false, "Allow EQL at Swing Start", group=G_LIQ, tooltip="OFF = strict mode: both (a) rejects a setup if equal-lows/highs liquidity sits at the swing origin (Section 3), AND (b) requires the Structure Stop 100% anchor to be a verified liquidity sweep (pierced the prior minor pivot by >=1 tick), not just the plain lowest/highest wick. ON = relaxes both — allows EQL at the swing origin, and uses plain trend-continuation anchoring without sweep verification.")
 strictSweepMode = not eqlAllowToggle
 
+// Intermarket Correlation / SMT divergence: tracks the correlated asset's
+// OWN high/low minor-pivot sweep status, using the same sweep-comparison
+// idea as Macro Anchor Sweep above — whenever a new pivot confirms, is it
+// beyond (swept) the PRIOR pivot of the same type? Run independently, on
+// its own request.security call below (can't nest a second symbol's pull
+// inside f_structure_stop_swing's own 4H security context).
+f_correlated_structure(_pivLen) =>
+    var float[] corrHighs    = array.new_float(0)
+    var float[] corrLows     = array.new_float(0)
+    var bool    corrHighSwept = false
+    var bool    corrLowSwept  = false
+    corrPivHigh = ta.pivothigh(high, _pivLen, _pivLen)
+    corrPivLow  = ta.pivotlow(low, _pivLen, _pivLen)
+    if not na(corrPivHigh)
+        array.push(corrHighs, corrPivHigh)
+        if array.size(corrHighs) > 1
+            corrHighSwept := corrPivHigh > array.get(corrHighs, array.size(corrHighs) - 2)
+        if array.size(corrHighs) > 150
+            array.shift(corrHighs)
+    if not na(corrPivLow)
+        array.push(corrLows, corrPivLow)
+        if array.size(corrLows) > 1
+            corrLowSwept := corrPivLow < array.get(corrLows, array.size(corrLows) - 2)
+        if array.size(corrLows) > 150
+            array.shift(corrLows)
+    [corrHighSwept, corrLowSwept]
+
+[corrHighSweptNow, corrLowSweptNow] = request.security(smtCorrelatedTicker, "240", f_correlated_structure(minorSwingPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+
 // Finds the most recent valid 4H FVG in direction _dir, then scans backward
 // for the minor swing point it broke (MSS/CHoCH origin), and anchors the
 // fib's 100% end at a verified liquidity-sweep wick between that break and
@@ -68,7 +101,7 @@ strictSweepMode = not eqlAllowToggle
 // FVG mitigation (any touch since formation invalidates it). Called twice
 // below (bull/bear) — each call site gets its own independent `var` state,
 // same pattern as f_smc_choch_trend's two calls elsewhere in this file.
-f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _strictSweep, _fibLevel) =>
+f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _strictSweep, _fibLevel, _corrHighSwept, _corrLowSwept) =>
     bodyRatio = math.abs(close[1] - open[1]) / (high[1] - low[1])
     atrv = ta.atr(14)
     fvgNow = _dir == 1 ? (low > high[2] and bodyRatio >= _dispRatio and (low - high[2]) >= atrv * _minAtrPct) : (high < low[2] and bodyRatio >= _dispRatio and (low[2] - high) >= atrv * _minAtrPct)
@@ -136,6 +169,10 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _st
     // this swing committed — 1 = CHoCH & BOS 1 (Fresh), 2 = BOS 2 (Mature),
     // 3 = >BOS 3 (Exhausted, capped — 3 or more all read as 3).
     var int   trendMaturity = 0
+    // SMT divergence at the swing anchor, captured at the moment this swing
+    // committed — long: trading asset swept a new low while the correlated
+    // asset did NOT sweep a new high. Short: mirrored on highs/lows.
+    var bool  smtDivergenceOk = false
     // Tracks which bar the active FVG formed on, so barsSinceFvg can prove
     // mitigation never fires on the formation bar itself (the if/fvgNow vs
     // else-if/touch-check split already makes this architecturally
@@ -227,6 +264,7 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _st
             swTime    := tmpSwTime
             macroAnchorSwept := tmpMacroSwept
             trendMaturity := math.min(tmBosCount, 3)
+            smtDivergenceOk := _dir == 1 ? not _corrHighSwept : not _corrLowSwept
     else if not na(fvgTop) and not fvgMitigated
         touched = _dir == 1 ? (low <= fvgTop) : (high >= fvgBot)
         if touched
@@ -237,10 +275,10 @@ f_structure_stop_swing(_dir, _minorPivLen, _dispRatio, _minAtrPct, _scanCap, _st
     barsSinceFvg = na(fvgFormationBar) ? na : bar_index - fvgFormationBar
     swHigh = _dir == 1 ? swAnchor : swExtreme
     swLow  = _dir == 1 ? swExtreme : swAnchor
-    [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated, barsSinceFvg, macroAnchorSwept, trendMaturity]
+    [swHigh, swLow, swTime, fvgTop, fvgBot, fvgMitigated, barsSinceFvg, macroAnchorSwept, trendMaturity, smtDivergenceOk]
 
-[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull, barsSinceFvgBull, macroAnchorSweptBull, trendMaturityBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel), barmerge.gaps_off, barmerge.lookahead_off)
-[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear, barsSinceFvgBear, macroAnchorSweptBear, trendMaturityBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBull, swLowBull, swTimeBull, fvgTopBull, fvgBotBull, fvgMitigatedBull, barsSinceFvgBull, macroAnchorSweptBull, trendMaturityBull, smtDivergenceOkBull] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel, corrHighSweptNow, corrLowSweptNow), barmerge.gaps_off, barmerge.lookahead_off)
+[swHighBear, swLowBear, swTimeBear, fvgTopBear, fvgBotBear, fvgMitigatedBear, barsSinceFvgBear, macroAnchorSweptBear, trendMaturityBear, smtDivergenceOkBear] = request.security(syminfo.tickerid, "240", f_structure_stop_swing(-1, minorSwingPivotLen, fvgDispRatio, fvgMinAtrPct, structureScanCap, strictSweepMode, fibEntryLevel, corrHighSweptNow, corrLowSweptNow), barmerge.gaps_off, barmerge.lookahead_off)
 
 // ============================================================================
 // 2. HTF BIAS ENGINE — Level 1 = strictest ... Level 3 = loosest. No Daily
@@ -336,6 +374,7 @@ activeFvgMitigated = biasDir == 1 ? fvgMitigatedBull : biasDir == -1 ? fvgMitiga
 activeBarsSinceFvg = biasDir == 1 ? barsSinceFvgBull : biasDir == -1 ? barsSinceFvgBear : na
 activeMacroAnchorSwept = biasDir == 1 ? macroAnchorSweptBull : biasDir == -1 ? macroAnchorSweptBear : false
 activeTrendMaturity = biasDir == 1 ? trendMaturityBull : biasDir == -1 ? trendMaturityBear : 0
+activeSmtDivergenceOk = biasDir == 1 ? smtDivergenceOkBull : biasDir == -1 ? smtDivergenceOkBear : false
 
 // entry-zone band (fibEntryLevel .. deep boundary), anchored off the
 // Structure Stop swing, in bias direction
@@ -436,7 +475,8 @@ killzoneUnmapped = sessionMode == "Per-Asset Killzone" and perAssetSession == "0
 // setupCandidate does not include a PD-array gate (4H-only system)
 macroAnchorSweepGate = macroAnchorSweepFilter ? activeMacroAnchorSwept : true
 trendMaturityGate = trendMaturityFilter == "Off (All Stages)" ? true : trendMaturityFilter == "CHoCH & BOS 1 (Fresh)" ? activeTrendMaturity == 1 : trendMaturityFilter == "BOS 2 (Mature)" ? activeTrendMaturity == 2 : activeTrendMaturity == 3
-setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activeFvgMitigated and macroAnchorSweepGate and trendMaturityGate
+smtGate = smtFilterOn ? activeSmtDivergenceOk : true
+setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activeFvgMitigated and macroAnchorSweepGate and trendMaturityGate and smtGate
 
 // ============================================================================
 // 5. ENTRY TRIGGER & INVALIDATION
@@ -878,7 +918,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " volAnomaly=" + str.tostring(volumeAnomalySeen) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " volAnomaly=" + str.tostring(volumeAnomalySeen) + " smtOk=" + str.tostring(activeSmtDivergenceOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
