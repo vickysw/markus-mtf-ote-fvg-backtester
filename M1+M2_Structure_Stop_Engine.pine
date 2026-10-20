@@ -1034,3 +1034,36 @@ if barstate.islast
 
     if killzoneUnmapped
         label.new(bar_index, low - mainAtr, "⚠ Ticker '" + syminfo.ticker + "' not in killzone map — add it to f_killzone_session()", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
+
+// ============================================================================
+// 12. PERFORMANCE DASHBOARD — same metrics client's own analysis sheet
+//     tracks (Win Rate %, Average R:R, Max Drawdown, Total Trades, Net
+//     Profit). Max Drawdown shown in account currency (Pine has no native
+//     max-drawdown-percent variable). "Trades Per Month" and "Mechanical
+//     Grade (A-E)" not included — the former needs a defined date range,
+//     the latter looks like a manual/subjective rating he assigns
+//     himself, not computed.
+// ============================================================================
+var table dash = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    winTrades   = strategy.wintrades
+    lossTrades  = strategy.losstrades
+    closedTrades = strategy.closedtrades
+    winRate     = closedTrades > 0 ? winTrades / closedTrades * 100 : na
+    avgWin      = winTrades > 0 ? strategy.grossprofit / winTrades : na
+    avgLoss     = lossTrades > 0 ? strategy.grossloss / lossTrades : na
+    avgRR       = not na(avgWin) and not na(avgLoss) and avgLoss != 0 ? avgWin / math.abs(avgLoss) : na
+
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(dash, 0, 1, "Win Rate %", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, na(winRate) ? "-" : str.tostring(winRate, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 2, "Average R:R", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, na(avgRR) ? "-" : str.tostring(avgRR, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "Max Drawdown", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 4, "Total Trades", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(closedTrades), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 5, "Net Profit", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.lime : color.red, text_size=size.small)
