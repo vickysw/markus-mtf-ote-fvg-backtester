@@ -472,11 +472,121 @@ inKillzone       = not na(time(timeframe.period, killzoneSession, "Europe/Stockh
 killzoneGate     = useKillzone ? inKillzone : true
 killzoneUnmapped = sessionMode == "Per-Asset Killzone" and perAssetSession == "0000-2359"
 
+// ============================================================================
+// 4b. NEWS FILTER (Multi-Asset High-Impact News Time-Blocker) — Option A:
+//     hardcoded event list (Pine has no native/built-in economic calendar
+//     function). List below is USD only so far (FOMC/CPI/NFP, 2026,
+//     verified against the Fed's and BLS's own published calendars as of
+//     2026-10-20) — needs periodic updates as new dates get announced, and
+//     other currencies (EUR/GBP/JPY/AUD/CAD/NZD) added, per client.
+// ============================================================================
+var string G_NEWS = "10. News Filter"
+newsFilterOn = input.bool(false, "Filter High-Impact News Windows", group=G_NEWS)
+newsBufferMode = input.string("1 Hour", "News Buffer Time", options=["15 Minutes", "1 Hour", "4 Hours"], group=G_NEWS, tooltip="Blocks entries this long before AND after the event's exact release time.")
+
+newsBufferMs = newsBufferMode == "15 Minutes" ? 15 * 60 * 1000 : newsBufferMode == "1 Hour" ? 60 * 60 * 1000 : 4 * 60 * 60 * 1000
+
+var int[]    newsTimestamps = array.new_int(0)
+var string[] newsCurrency   = array.new_string(0)
+
+f_addNewsEvent(_y, _m, _d, _h, _min, _ccy) =>
+    array.push(newsTimestamps, timestamp("Europe/Stockholm", _y, _m, _d, _h, _min))
+    array.push(newsCurrency, _ccy)
+
+if barstate.isfirst
+    // FOMC Rate Decisions 2026 (~20:00 Stockholm — 2:00pm ET)
+    f_addNewsEvent(2026, 1, 28, 20, 0, "USD")
+    f_addNewsEvent(2026, 3, 18, 20, 0, "USD")
+    f_addNewsEvent(2026, 4, 29, 20, 0, "USD")
+    f_addNewsEvent(2026, 6, 17, 20, 0, "USD")
+    f_addNewsEvent(2026, 7, 29, 20, 0, "USD")
+    f_addNewsEvent(2026, 9, 16, 20, 0, "USD")
+    f_addNewsEvent(2026, 10, 28, 20, 0, "USD")
+    f_addNewsEvent(2026, 12, 9, 20, 0, "USD")
+    // CPI 2026 (~14:30 Stockholm — 8:30am ET)
+    f_addNewsEvent(2026, 1, 13, 14, 30, "USD")
+    f_addNewsEvent(2026, 2, 13, 14, 30, "USD")
+    f_addNewsEvent(2026, 3, 11, 14, 30, "USD")
+    f_addNewsEvent(2026, 4, 10, 14, 30, "USD")
+    f_addNewsEvent(2026, 5, 12, 14, 30, "USD")
+    f_addNewsEvent(2026, 6, 10, 14, 30, "USD")
+    f_addNewsEvent(2026, 7, 14, 14, 30, "USD")
+    f_addNewsEvent(2026, 8, 12, 14, 30, "USD")
+    f_addNewsEvent(2026, 9, 11, 14, 30, "USD")
+    f_addNewsEvent(2026, 10, 14, 14, 30, "USD")
+    f_addNewsEvent(2026, 11, 10, 14, 30, "USD")
+    f_addNewsEvent(2026, 12, 10, 14, 30, "USD")
+    // NFP 2026 (~14:30 Stockholm — 8:30am ET)
+    f_addNewsEvent(2026, 2, 11, 14, 30, "USD")
+    f_addNewsEvent(2026, 3, 6, 14, 30, "USD")
+    f_addNewsEvent(2026, 4, 3, 14, 30, "USD")
+    f_addNewsEvent(2026, 5, 8, 14, 30, "USD")
+    f_addNewsEvent(2026, 6, 5, 14, 30, "USD")
+    f_addNewsEvent(2026, 7, 2, 14, 30, "USD")
+    f_addNewsEvent(2026, 8, 7, 14, 30, "USD")
+    f_addNewsEvent(2026, 9, 4, 14, 30, "USD")
+    f_addNewsEvent(2026, 10, 2, 14, 30, "USD")
+    f_addNewsEvent(2026, 11, 6, 14, 30, "USD")
+    f_addNewsEvent(2026, 12, 4, 14, 30, "USD")
+
+// Dynamic Asset Detection: maps the chart's symbol to the currency(ies) its
+// price is exposed to — a pair maps to BOTH sides (e.g. EURUSD -> EUR, USD),
+// a single-currency instrument (XAUUSD, the USD indices) maps to just USD.
+f_relevant_currencies() =>
+    t = syminfo.ticker
+    array<string> ccys = array.new_string(0)
+    if t == "EURUSD"
+        array.push(ccys, "EUR")
+        array.push(ccys, "USD")
+    else if t == "GBPUSD"
+        array.push(ccys, "GBP")
+        array.push(ccys, "USD")
+    else if t == "AUDUSD"
+        array.push(ccys, "AUD")
+        array.push(ccys, "USD")
+    else if t == "NZDUSD"
+        array.push(ccys, "NZD")
+        array.push(ccys, "USD")
+    else if t == "EURJPY"
+        array.push(ccys, "EUR")
+        array.push(ccys, "JPY")
+    else if t == "GBPJPY"
+        array.push(ccys, "GBP")
+        array.push(ccys, "JPY")
+    else if t == "XAUUSD"
+        array.push(ccys, "USD")
+    else if t == "USTEC100" or t == "NAS100" or t == "US100" or t == "USTEC" or t == "US30" or t == "DJ30" or t == "SPX500" or t == "US500" or t == "SP500" or t == "SPX"
+        array.push(ccys, "USD")
+    ccys
+
+relevantCcys = f_relevant_currencies()
+
+// Is `_t` within the buffer window of any event matching this chart's
+// relevant currency(ies)?
+f_in_news_window(_t) =>
+    bool inWindow = false
+    if array.size(newsTimestamps) > 0
+        for i = 0 to array.size(newsTimestamps) - 1
+            evCcy = array.get(newsCurrency, i)
+            matches = false
+            if array.size(relevantCcys) > 0
+                for j = 0 to array.size(relevantCcys) - 1
+                    if array.get(relevantCcys, j) == evCcy
+                        matches := true
+            if matches
+                evTime = array.get(newsTimestamps, i)
+                if math.abs(_t - evTime) <= newsBufferMs
+                    inWindow := true
+    inWindow
+
+inNewsBlockWindow = newsFilterOn and f_in_news_window(time)
+newsGate = not inNewsBlockWindow
+
 // setupCandidate does not include a PD-array gate (4H-only system)
 macroAnchorSweepGate = macroAnchorSweepFilter ? activeMacroAnchorSwept : true
 trendMaturityGate = trendMaturityFilter == "Off (All Stages)" ? true : trendMaturityFilter == "CHoCH & BOS 1 (Fresh)" ? activeTrendMaturity == 1 : trendMaturityFilter == "BOS 2 (Mature)" ? activeTrendMaturity == 2 : activeTrendMaturity == 3
 smtGate = smtFilterOn ? activeSmtDivergenceOk : true
-setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activeFvgMitigated and macroAnchorSweepGate and trendMaturityGate and smtGate
+setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activeFvgMitigated and macroAnchorSweepGate and trendMaturityGate and smtGate and newsGate
 
 // ============================================================================
 // 5. ENTRY TRIGGER & INVALIDATION
@@ -918,7 +1028,7 @@ if barstate.islast
     biasLbl := label.new(bar_index, high + mainAtr, lvlTxt + " / " + dirTxt + statusTxt, style=label.style_label_down, color=setupCandidate ? color.green : color.gray, textcolor=color.white, size=size.small)
 
     if showDebug
-        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " volAnomaly=" + str.tostring(volumeAnomalySeen) + " smtOk=" + str.tostring(activeSmtDivergenceOk) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
+        debugTxt = "DEBUG swHigh=" + str.tostring(swHigh, format.mintick) + " swLow=" + str.tostring(swLow, format.mintick) + " | zoneTop=" + str.tostring(fibZoneTop, format.mintick) + " zoneBot=" + str.tostring(fibZoneBot, format.mintick) + " zoneTouched=" + str.tostring(zoneTouched) + " | fvgTop=" + str.tostring(activeFvgTop, format.mintick) + " fvgBot=" + str.tostring(activeFvgBot, format.mintick) + " mitigated=" + str.tostring(activeFvgMitigated) + " barsSinceFvg=" + str.tostring(activeBarsSinceFvg) + " fvgDepthOk=" + str.tostring(fvgDepthOk) + " macroSwept=" + str.tostring(activeMacroAnchorSwept) + " trendMaturity=" + str.tostring(activeTrendMaturity) + " volAnomaly=" + str.tostring(volumeAnomalySeen) + " smtOk=" + str.tostring(activeSmtDivergenceOk) + " inNewsWindow=" + str.tostring(inNewsBlockWindow) + " | SL=" + str.tostring(activeSL, format.mintick) + " TP=" + str.tostring(tpPrice, format.mintick) + " qty=" + str.tostring(tradeQty, "#.####") + " pointvalue=" + str.tostring(pointValue, "#.####") + " rawPointvalue=" + str.tostring(rawPointValue)
         label.delete(debugLbl)
         debugLbl := label.new(bar_index, low - mainAtr * 2, debugTxt, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
