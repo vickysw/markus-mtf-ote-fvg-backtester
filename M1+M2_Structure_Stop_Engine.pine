@@ -966,6 +966,20 @@ else
 longCondition  = activeEntrySignal and biasDir == 1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
 shortCondition = activeEntrySignal and biasDir == -1 and strategy.position_size == 0 and not na(activeSL) and not na(tpPrice) and not na(tradeQty) and tradeQty > 0
 
+// 6-line-per-trade visualization: drawn once at the moment of entry, so
+// every historical trade stays visually annotated when scrolling back
+// through the backtest, not just the current/live one. Pine retains these
+// line objects automatically up to max_lines_count (500, set in the
+// strategy() declaration above) — oldest drop off first once that's hit.
+f_draw_trade_lines(_entryPrice, _lineColor) =>
+    extendBars = 10
+    line.new(bar_index, swHigh, bar_index + extendBars, swHigh, color=color.blue, width=1, xloc=xloc.bar_index)
+    line.new(bar_index, swLow, bar_index + extendBars, swLow, color=color.blue, width=1, xloc=xloc.bar_index)
+    line.new(bar_index, activeFvgTop, bar_index + extendBars, activeFvgTop, color=color.fuchsia, width=1, xloc=xloc.bar_index)
+    line.new(bar_index, activeFvgBot, bar_index + extendBars, activeFvgBot, color=color.fuchsia, width=1, xloc=xloc.bar_index)
+    line.new(bar_index, activeSL, bar_index + extendBars, activeSL, color=color.red, width=1, xloc=xloc.bar_index)
+    line.new(bar_index, _entryPrice, bar_index + extendBars, _entryPrice, color=_lineColor, width=2, xloc=xloc.bar_index)
+
 // A limit order (Direct Limit Touch, or Option B's redrawn 0.382 level)
 // fills at the intended price rather than at the signal bar's close. CISD
 // Confirmation (non-Option-B) stays a market order, since the trigger IS a
@@ -978,6 +992,7 @@ if longCondition
         strategy.entry("Long", strategy.long, qty=tradeQty)
     strategy.exit("Exit Long", from_entry="Long", stop=activeSL, limit=tpPrice)
     tradeTakenSwing := true
+    f_draw_trade_lines(activeEntryPrice, color.green)
 
 if shortCondition
     if activeIsLimitEntry
@@ -986,6 +1001,7 @@ if shortCondition
         strategy.entry("Short", strategy.short, qty=tradeQty)
     strategy.exit("Exit Short", from_entry="Short", stop=activeSL, limit=tpPrice)
     tradeTakenSwing := true
+    f_draw_trade_lines(activeEntryPrice, color.red)
 
 // ============================================================================
 // 11. VISUAL / QA — sanity-check only. Full persisted 6-line-per-trade
