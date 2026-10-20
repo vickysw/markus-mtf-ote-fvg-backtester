@@ -443,9 +443,11 @@ setupCandidate = bias_tradeable and killzoneGate and liquidityGate and not activ
 // ============================================================================
 var string G_ENTRY = "5. Entry Trigger"
 entryTriggerMode = input.string("CISD Confirmation", "Entry Trigger", options=["Direct Limit Touch", "CISD Confirmation"], group=G_ENTRY, tooltip="Direct Limit Touch = enter as soon as price touches the fib entry level. CISD Confirmation = wait for a body-close reversal back through the last opposite-colour candle's open, while price is inside the zone.")
-// Applies to this Section 5 CISD entry flow (Options A & C, which share it)
-// — Option B has its own separate entry flow (Section 5b), not covered.
-volumeAnomalyFilter = input.bool(false, "Volume Anomaly Filter (15m)", group=G_ENTRY, tooltip="ON = requires at least one 15m bar, matching the trade's direction (green for long/red for short), with volume below its 20-period EMA, somewhere between the zone touch and entry trigger — a sign of a low-volume pause before the move. OFF = no check.")
+// Global gate (Section 7 below applies it to activeEntrySignal) — covers
+// all 3 SL models (Options A, B and C), per client request 2026-10-19.
+// Scan window itself is still the shared zoneTouched period (Section 5),
+// which all 3 options pass through regardless of which is selected.
+volumeAnomalyFilter = input.bool(false, "Volume Anomaly Filter (15m)", group=G_ENTRY, tooltip="ON = requires at least one 15m bar, matching the trade's direction (green for long/red for short), with volume below its 20-period EMA, somewhere between the zone touch and entry trigger — a sign of a low-volume pause before the move. Applies globally to all 3 SL models. OFF = no check.")
 
 entryPrice   = biasDir == 1 ? fibZoneTop : biasDir == -1 ? fibZoneBot : na
 deepBoundary = biasDir == 1 ? fibZoneBot : biasDir == -1 ? fibZoneTop : na
@@ -537,7 +539,7 @@ if zoneTouched and not setupInvalid and not tradeTakenSwing
         volumeAnomalySeen := true
 volumeAnomalyGate = volumeAnomalyFilter ? volumeAnomalySeen : true
 
-entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and volumeAnomalyGate and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
+entrySignal = zoneTouched and not setupInvalid and not tradeTakenSwing and (entryTriggerMode == "Direct Limit Touch" ? inZone : cisdTriggered)
 
 // Declared here (not Section 6, where it's grouped/shown — same pattern as
 // eqlAllowToggle in Section 1b) because Section 5b below needs it, and Pine
@@ -675,7 +677,13 @@ activeSL = slModel == "Option A: Fixed 4H Fib" ? slA_price : slModel == "Option 
 // CISD-vs-limit choice on top of it).
 usingOptionB      = slModel == "Option B: Local 15m Swing Extension"
 activeEntryPrice  = usingOptionB ? optB_entryPrice : entryPrice
-activeEntrySignal = usingOptionB ? (optB_phase == 2 and setupCandidate and not tradeTakenSwing) : entrySignal
+// Volume Anomaly Filter applied here (not inside setupCandidate — the scan
+// window only starts once zoneTouched is already true, which itself needs
+// setupCandidate true first; gating setupCandidate on it would be
+// circular). Applying it here instead makes it a genuinely global gate
+// across Options A, B and C, since zoneTouched (and therefore the scan
+// window) is shared by all three per client request 2026-10-19.
+activeEntrySignal = (usingOptionB ? (optB_phase == 2 and setupCandidate and not tradeTakenSwing) : entrySignal) and volumeAnomalyGate
 activeIsLimitEntry = usingOptionB or entryTriggerMode == "Direct Limit Touch"
 
 // Actual fill price used for risk math — NOT always the same as
